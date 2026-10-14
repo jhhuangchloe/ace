@@ -5,18 +5,21 @@
 # One-time data copy (~190 GB, ~35 min at ~90 MB/s; resumable):
 #   conda run -n fme python configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/prepare_data.py
 #
-# Run (vortex variant on GPUs 3,4,5):
+# Run (vortex variant on GPUs 1,2,4,6,7):
 #   bash configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/run.sh
 # Control (same data/steps, linear baseline) -- run after, or on other GPUs:
 #   VARIANT=control bash configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/run.sh
-#   VARIANT=control GPUS=0,1,2 bash .../run.sh
-# Other knobs: GPUS="3,4,5" (comma list; the configs use global batch_size 6, so
-# use 1, 2, 3 or 6 GPUs, or edit batch_size; NCCL_SHM_DISABLE=1 helped when GPUs span
+#   VARIANT=control GPUS=3,5 bash .../run.sh
+# Other knobs: GPUS="1,2,4,6,7" (comma list; the configs use global batch_size 5, so
+# use 1 or 5 GPUs, or edit batch_size; NCCL_SHM_DISABLE=1 helped when GPUs span
 # both CPU sockets), ENV_NAME=fme, CONFIG=<path> to override the config.
 set -euo pipefail
 
+# GPUs spanning both CPU sockets hit a NCCL shared-memory error here without this.
+export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
+
 VARIANT="${VARIANT:-vortex}"
-GPUS="${GPUS:-3,4,5}"
+GPUS="${GPUS:-1,2,4,6,7}"
 ENV_NAME="${ENV_NAME:-fme}"
 DATA_DIR="/data/pmd/local_data"
 
