@@ -1527,3 +1527,92 @@ def test_two_block_noise_respects_block_subspaces(model_fixture):
         atol=1e-5,
     )
     assert noise_d.std() > 1e-3  # not degenerate
+
+
+def _vortex_two_block_model(n_times, **config_kwargs):
+    return _two_block_model(
+        n_times,
+        vortex_shift_baseline=True,
+        vortex_slp_channel="var0",
+        vortex_min_depth=2.0,
+        vortex_search_cells=12.0,
+        **config_kwargs,
+    )
+
+
+def _batch_with_travelling_low(n_times, coarse_size=24, factor=2, batch_size=2):
+    """Spatial paired batch whose coarse ``var0`` holds a Gaussian low moving
+    10 cells along the grid over the clip."""
+    batch = _spatial_paired_batch(
+        batch_size=batch_size,
+        n_times=n_times,
+        fine_height=coarse_size * factor,
+        fine_width=coarse_size * factor,
+        downscale_factor=factor,
+    )
+    rows = torch.arange(coarse_size, dtype=torch.float32)[:, None]
+    cols = torch.arange(coarse_size, dtype=torch.float32)[None, :]
+    frames = []
+    for k in range(n_times):
+        c_col = 7.0 + 10.0 * k / (n_times - 1)
+        frames.append(
+            -10.0 * torch.exp(-((rows - 12.0) ** 2 + (cols - c_col) ** 2) / 8.0)
+        )
+    batch.coarse.data["var0"] = torch.stack(frames).expand(batch_size, -1, -1, -1)
+    return batch
+
+
+def test_vortex_shift_baseline_requires_two_block():
+    with pytest.raises(ValueError, match="vortex_shift_baseline requires two_block"):
+        _coarse_endpoints_only_model(5, vortex_shift_baseline=True)
+
+
+def test_vortex_shift_baseline_rejects_unknown_slp_channel():
+    with pytest.raises(ValueError, match="vortex_slp_channel"):
+        _two_block_model(5, vortex_shift_baseline=True, vortex_slp_channel="PRMSL")
+
+
+def test_vortex_shift_baseline_adds_baseline_conditioning_channels():
+    n_times = 5
+    plain = _two_block_model(n_times).module.module.model
+    vortex = _vortex_two_block_model(n_times).module.module.model
+    assert vortex.in_conv.conv.in_channels == plain.in_conv.conv.in_channels + len(
+        OUT_NAMES
+    )
+
+
+def test_vortex_shift_baseline_moves_the_storm_and_pins_endpoints():
+    n_times = 5
+    model = _vortex_two_block_model(n_times)
+    batch = _batch_with_travelling_low(n_times)
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    shifted = model._two_block_interp(coarse)
+    linear = coarse_temporal_interp(coarse)
+    assert torch.equal(shifted[:, :, 0], coarse[:, :, 0])
+    assert torch.equal(shifted[:, :, -1], coarse[:, :, -1])
+    truth_err = ((linear - coarse) ** 2).mean()
+    assert ((shifted - coarse) ** 2).mean() < 0.5 * truth_err
+
+
+def test_vortex_shift_baseline_train_and_exact_coarse_recovery():
+    n_times, factor = 5, 2
+    model = _vortex_two_block_model(n_times)
+    batch = _batch_with_travelling_low(n_times, factor=factor)
+
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    assert all(
+        torch.isfinite(p.grad).all()
+        for p in model.module.parameters()
+        if p.grad is not None
+    )
+
+    generated = model.generate(batch, n_samples=2)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    for name in OUT_NAMES:
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)

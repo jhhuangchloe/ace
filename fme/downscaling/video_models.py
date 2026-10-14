@@ -91,8 +91,8 @@ from fme.downscaling.twoblock import (
     conservative_downsample,
     d_target,
     null_space_projector,
-    r_target,
 )
+from fme.downscaling.vortex_shift import vortex_shift_interp
 
 CHANNEL_AXIS = 1
 
@@ -489,6 +489,25 @@ class VideoDiffusionModelConfig:
     # (conditional_kernel.project_onto_kernel_hull) -- kept out of the DSM
     # graph via detach(), not a second optimizer.
     two_block_conditional_kernel: bool = False
+    # Translation-aware two-block baseline (fme/downscaling/vortex_shift.py).
+    # Linear temporal interpolation of the coarse endpoints cross-fades a
+    # moving vortex instead of translating it, so r = x_c - I has to carry the
+    # whole displacement. When True, I(tau) is replaced near a detected
+    # sea-level-pressure low (found from the two coarse endpoint frames only,
+    # so it's available at inference) by the two endpoint vortices translated
+    # to the linearly interpolated storm centre; samples with no detected low
+    # keep plain linear interpolation, and the endpoints stay pinned exactly.
+    # The baseline, upsampled to fine resolution, is also added to the
+    # network's conditioning at every frame (the network can't otherwise know
+    # where the storm was moved), so this changes in_channels: from-scratch
+    # runs only. Requires two_block=True.
+    vortex_shift_baseline: bool = False
+    vortex_slp_channel: str = "PRMSL"
+    # Minimum depth (in the channel's physical units, hPa for PRMSL) of a low
+    # below its surrounding ring for it to count as a vortex.
+    vortex_min_depth: float = 5.0
+    vortex_taper_cells: float = 6.0  # coarse cells
+    vortex_search_cells: float = 10.0  # max endpoint-to-endpoint centre distance
     weight_fit_loss_weight: float = 1.0
     condition_encoder_hidden: int = 16
 
@@ -822,6 +841,30 @@ class VideoDiffusionModelConfig:
                     "condition_encoder_hidden must be >= 1, got "
                     f"{self.condition_encoder_hidden}."
                 )
+        if self.vortex_shift_baseline:
+            if not self.two_block:
+                raise ValueError("vortex_shift_baseline requires two_block=True.")
+            if self.vortex_slp_channel not in self.out_names:
+                raise ValueError(
+                    f"vortex_slp_channel {self.vortex_slp_channel!r} must be one "
+                    f"of out_names {self.out_names}."
+                )
+            if self.vortex_slp_channel in (self.log_transform_channels or {}):
+                raise ValueError(
+                    "vortex_slp_channel must not be a log-transformed channel."
+                )
+            if (
+                min(
+                    self.vortex_min_depth,
+                    self.vortex_taper_cells,
+                    self.vortex_search_cells,
+                )
+                <= 0.0
+            ):
+                raise ValueError(
+                    "vortex_min_depth, vortex_taper_cells and vortex_search_cells "
+                    "must be > 0."
+                )
         if self.backbone not in ("simple", "songunet"):
             raise ValueError(
                 f"backbone must be 'simple' or 'songunet', got {self.backbone}."
@@ -1026,6 +1069,8 @@ class VideoDiffusionModelConfig:
             # of n_channels.
             assert coarse_normalizer is not None
             in_channels = 4 * n_channels + n_channels + 1
+            if self.vortex_shift_baseline:
+                in_channels += n_channels  # upsampled translation-aware baseline
             out_channels = 2 * n_channels
             sigma_data = self.two_block_sigma_data_tensor(get_device())
         else:
@@ -1754,6 +1799,42 @@ class VideoDiffusionModel:
         )
         return torch.cat([noise_r_fine, noise_d], dim=CHANNEL_AXIS)
 
+    def _two_block_interp(self, coarse_clip: torch.Tensor) -> torch.Tensor:
+        """``I(tau)`` on the coarse grid: linear in time, or translation-aware
+        near a detected vortex when ``vortex_shift_baseline`` is set.
+        """
+        if not self.config.vortex_shift_baseline:
+            return coarse_temporal_interp(coarse_clip)
+        assert self.coarse_normalizer is not None
+        channel = self.config.vortex_slp_channel
+        # min_depth is configured in physical units; clips are normalized.
+        min_depth = self.config.vortex_min_depth / float(
+            self.coarse_normalizer.stds[channel]
+        )
+        return vortex_shift_interp(
+            coarse_clip,
+            slp_index=self.out_names.index(channel),
+            min_depth=min_depth,
+            taper_cells=self.config.vortex_taper_cells,
+            search_cells=self.config.vortex_search_cells,
+        )
+
+    def _two_block_condition(
+        self,
+        fine_clip: torch.Tensor,
+        r_mask: torch.Tensor,
+        coarse_upsampled: torch.Tensor,
+        interp: torch.Tensor,
+        factor: int,
+    ) -> torch.Tensor:
+        condition = self._conditioning(fine_clip, r_mask, coarse_upsampled)
+        if self.config.vortex_shift_baseline:
+            condition = torch.cat(
+                [condition, block_replicate_upsample(interp, factor)],
+                dim=CHANNEL_AXIS,
+            )
+        return condition
+
     def _train_on_batch_two_block(
         self, batch: PairedVideoBatchData, optimizer
     ) -> ModelOutputs:
@@ -1773,7 +1854,8 @@ class VideoDiffusionModel:
         batch_size, n_channels, n_times, fine_h, fine_w = fine_clip.shape
         factor = fine_h // coarse_clip.shape[-2]
 
-        r, interp = r_target(coarse_clip)
+        interp = self._two_block_interp(coarse_clip)
+        r = coarse_clip - interp
         d = d_target(fine_clip, coarse_clip, factor)
         r_fine = block_replicate_upsample(r, factor)
         residual = torch.cat([r_fine, d], dim=CHANNEL_AXIS)  # (B, 2C, T, Hf, Wf)
@@ -1792,7 +1874,9 @@ class VideoDiffusionModel:
         # _conditioning's fine-endpoint block is a no-op here (endpoints_observed
         # is False, validated in __post_init__) -- only coarse_upsampled matters,
         # masked to the endpoint positions via coarse_endpoints_only.
-        condition = self._conditioning(fine_clip, r_mask, coarse_upsampled)
+        condition = self._two_block_condition(
+            fine_clip, r_mask, coarse_upsampled, interp, factor
+        )
 
         r_mixing, d_mixing, weight_fit_loss = (
             self._two_block_mixings_and_weight_fit_loss(
@@ -2049,7 +2133,7 @@ class VideoDiffusionModel:
         batch_size, n_channels, n_times, fine_h, fine_w = fine_clip.shape
         factor = fine_h // coarse_clip.shape[-2]
 
-        interp = coarse_temporal_interp(coarse_clip)
+        interp = self._two_block_interp(coarse_clip)
         r_mask = _interior_mask(n_times, fine_clip.device, endpoints_observed=True)
         d_mask = _interior_mask(n_times, fine_clip.device, endpoints_observed=False)
         mask = torch.cat(
@@ -2061,7 +2145,9 @@ class VideoDiffusionModel:
         )
         coarse_h, coarse_w = coarse_clip.shape[-2:]
         coarse_upsampled = block_replicate_upsample(coarse_clip, factor)
-        condition = self._conditioning(fine_clip, r_mask, coarse_upsampled)
+        condition = self._two_block_condition(
+            fine_clip, r_mask, coarse_upsampled, interp, factor
+        )
         # Computed on the un-repeated batch: condition features/g_phi only
         # depend on the true condition c, not the ensemble size.
         r_mixing, d_mixing, _ = self._two_block_mixings_and_weight_fit_loss(
