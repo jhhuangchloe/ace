@@ -1221,7 +1221,7 @@ def test_two_block_requires_coarse_endpoints_only_mode():
             {"sigma_data_by_channel": {"var0": 1.0}},
             "r_\\*/d_\\*-prefixed sigma/noise fields",
         ),
-        ({"r_kernel": "ou"}, "r_kernel must be"),
+        ({"r_kernel": "bogus"}, "r_kernel must be"),
         ({"d_kernel": "brownian_bridge"}, "d_kernel must be"),
         ({"d_kernel": "ou"}, "d_kernel_length_scale"),
         ({"d_kernel_length_scale": -1.0}, "d_kernel_length_scale must be"),
@@ -1751,6 +1751,120 @@ def test_v3_baseline_train_and_exact_coarse_recovery(tmp_path):
     # exact in model space, so in physical space only for channels without a log
     # transform
     for name in [n for n in OUT_NAMES if n != "var1"]:
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
+def _pinned_ou_covariance(n_times, length):
+    tau = torch.linspace(0.0, 1.0, n_times, dtype=torch.float64)[1:-1]
+    return torch.exp(-(tau[:, None] - tau[None, :]).abs() / length)
+
+
+@pytest.mark.parametrize(
+    "bad_kwargs,match",
+    [
+        ({"r_kernel": "ou"}, "needs r_kernel_length_scale"),
+        (
+            {"r_kernel": "ou", "r_kernel_length_scale_by_channel": {"var0": 0.2}},
+            "needs r_kernel_length_scale",
+        ),
+        (
+            {
+                "r_kernel": "ou",
+                "r_kernel_length_scale_by_channel": {"var0": 0.2, "other": 0.3},
+            },
+            "not in out_names",
+        ),
+        ({"r_kernel": "ou", "r_kernel_length_scale": 0.0}, "must be > 0"),
+        ({"r_kernel_length_scale": 0.3}, "only used with r_kernel='ou'"),
+        ({"r_kernel_length_scale_by_channel": {"var0": 0.3}}, "only used with"),
+        (
+            {"r_kernel": "ou", "r_kernel_length_scale": 0.3, "d_kernel": "bogus"},
+            "d_kernel must be",
+        ),
+    ],
+)
+def test_ou_r_kernel_config_validation(bad_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _two_block_model(5, **bad_kwargs)
+
+
+def test_ou_r_kernel_length_scales_require_two_block():
+    with pytest.raises(ValueError, match="require two_block"):
+        _coarse_endpoints_only_model(5, r_kernel_length_scale=0.3)
+
+
+def test_ou_r_kernel_with_conditional_kernel_is_rejected():
+    with pytest.raises(ValueError, match="supersedes"):
+        _two_block_model(
+            5,
+            two_block_conditional_kernel=True,
+            r_kernel="ou",
+            r_kernel_length_scale=0.3,
+        )
+
+
+def test_ou_r_kernel_uses_one_pinned_ou_correlation_per_channel():
+    n_times = 9
+    lengths = {"var0": 0.2, "var1": 0.5}
+    model = _two_block_model(
+        n_times, r_kernel="ou", r_kernel_length_scale_by_channel=lengths
+    )
+    mixing = model._two_block_noise_mixing  # (2 * C, T, T): r channels, then d channels
+    assert mixing.shape[0] == 2 * len(OUT_NAMES)
+    for i, name in enumerate(OUT_NAMES):
+        r_mix = mixing[i].double()
+        assert torch.equal(r_mix[0], torch.zeros_like(r_mix[0]))  # endpoints pinned
+        assert torch.equal(r_mix[-1], torch.zeros_like(r_mix[-1]))
+        interior = (r_mix @ r_mix.T)[1:-1, 1:-1]
+        torch.testing.assert_close(
+            interior, _pinned_ou_covariance(n_times, lengths[name]), atol=1e-6, rtol=0
+        )
+    # the d block is untouched by the r kernel choice
+    reference = _two_block_model(n_times)._two_block_noise_mixing
+    assert torch.equal(mixing[len(OUT_NAMES) :], reference[len(OUT_NAMES) :])
+
+
+def test_ou_r_kernel_scalar_length_applies_to_unlisted_channels():
+    model = _two_block_model(
+        9,
+        r_kernel="ou",
+        r_kernel_length_scale=0.3,
+        r_kernel_length_scale_by_channel={"var1": 0.1},
+    )
+    mixing = model._two_block_noise_mixing.double()
+    for i, length in ((0, 0.3), (1, 0.1)):
+        torch.testing.assert_close(
+            (mixing[i] @ mixing[i].T)[1:-1, 1:-1],
+            _pinned_ou_covariance(9, length),
+            atol=1e-6,
+            rtol=0,
+        )
+
+
+def test_ou_r_kernel_train_and_exact_coarse_recovery():
+    n_times, factor = 5, 2
+    model = _two_block_model(
+        n_times,
+        r_kernel="ou",
+        r_kernel_length_scale_by_channel={"var0": 0.2, "var1": 0.4},
+    )
+    batch = _spatial_paired_batch(
+        batch_size=2,
+        n_times=n_times,
+        fine_height=8,
+        fine_width=8,
+        downscale_factor=factor,
+    )
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    generated = model.generate(batch, n_samples=2)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    for name in OUT_NAMES:
         down = conservative_downsample(generated[name], factor)
         ref = interp_phys[name].unsqueeze(1).expand_as(down)
         assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)

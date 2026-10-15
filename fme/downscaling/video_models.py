@@ -457,7 +457,19 @@ class VideoDiffusionModelConfig:
     # marginal_consistency_weight, and endpoint_super_resolution (none
     # implemented for this mode -- out of scope for the first version).
     two_block: bool = False
-    r_kernel: str = "brownian_bridge"  # "independent" or "brownian_bridge"
+    r_kernel: str = "brownian_bridge"  # "independent", "brownian_bridge", or "ou"
+    # Required iff r_kernel == "ou" (for every channel not listed in
+    # r_kernel_length_scale_by_channel): decorrelation length of the
+    # endpoint-pinned OU kernel, in units of the clip duration (frame times
+    # lie on [0, 1], so 0.25 is a quarter of the window). An OU r kernel is
+    # unit-variance on the interior frames, like the bridge kernel; unlike the
+    # bridge it decorrelates at a chosen rate, which fits residuals that are
+    # less temporally coherent than a random-walk bridge (e.g. after a
+    # learned baseline has removed the smooth part of the trajectory).
+    r_kernel_length_scale: float | None = None
+    # Per-channel override of r_kernel_length_scale (same units); the noise of
+    # each r channel is then drawn with its own OU correlation.
+    r_kernel_length_scale_by_channel: dict[str, float] | None = None
     d_kernel: str = "independent"  # "independent", "ou", or "rbf"
     # Required iff d_kernel in ("ou", "rbf"); see
     # per_channel_kernel_length_scale's docstring for units.
@@ -732,6 +744,8 @@ class VideoDiffusionModelConfig:
             "d_sigma_max_by_channel",
             "r_training_noise_distribution",
             "d_training_noise_distribution",
+            "r_kernel_length_scale",
+            "r_kernel_length_scale_by_channel",
         )
         if self.two_block:
             if self.endpoints_observed or not self.coarse_endpoints_only:
@@ -783,11 +797,12 @@ class VideoDiffusionModelConfig:
                     "(requires endpoints_observed=True, which two_block "
                     "forbids)."
                 )
-            if self.r_kernel not in ("independent", "brownian_bridge"):
+            if self.r_kernel not in ("independent", "brownian_bridge", "ou"):
                 raise ValueError(
-                    "r_kernel must be 'independent' or 'brownian_bridge', "
+                    "r_kernel must be 'independent', 'brownian_bridge', or 'ou', "
                     f"got {self.r_kernel!r}."
                 )
+            self._validate_r_kernel_length_scales()
             if self.d_kernel not in ("independent", "ou", "rbf"):
                 raise ValueError(
                     "d_kernel must be 'independent', 'ou', or 'rbf', got "
@@ -838,6 +853,8 @@ class VideoDiffusionModelConfig:
                 )
             if (
                 self.r_kernel != "brownian_bridge"
+                or self.r_kernel_length_scale is not None
+                or self.r_kernel_length_scale_by_channel is not None
                 or self.d_kernel != "independent"
                 or self.d_kernel_length_scale is not None
             ):
@@ -905,6 +922,42 @@ class VideoDiffusionModelConfig:
             )
         if self.backbone == "songunet" and self.img_resolution is None:
             raise ValueError("songunet backbone requires img_resolution [H, W].")
+
+    def _validate_r_kernel_length_scales(self) -> None:
+        by_channel = self.r_kernel_length_scale_by_channel
+        if self.r_kernel != "ou":
+            if self.r_kernel_length_scale is not None or by_channel is not None:
+                raise ValueError(
+                    "r_kernel_length_scale and r_kernel_length_scale_by_channel "
+                    "are only used with r_kernel='ou'."
+                )
+            return
+        by_channel = by_channel or {}
+        unknown = set(by_channel) - set(self.out_names)
+        if unknown:
+            raise ValueError(
+                "r_kernel_length_scale_by_channel has channels not in out_names: "
+                f"{sorted(unknown)}."
+            )
+        if self.r_kernel_length_scale is None and set(by_channel) != set(
+            self.out_names
+        ):
+            raise ValueError(
+                "r_kernel='ou' needs r_kernel_length_scale, or "
+                "r_kernel_length_scale_by_channel for every channel."
+            )
+        lengths = list(by_channel.values())
+        if self.r_kernel_length_scale is not None:
+            lengths.append(self.r_kernel_length_scale)
+        if any(length <= 0.0 for length in lengths):
+            raise ValueError("r_kernel length scales must be > 0.")
+
+    def r_kernel_length_scale_for(self, name: str) -> float:
+        """OU decorrelation length of one r channel (only for ``r_kernel='ou'``)."""
+        by_channel = self.r_kernel_length_scale_by_channel or {}
+        length = by_channel.get(name, self.r_kernel_length_scale)
+        assert length is not None
+        return length
 
     @property
     def noise_distribution(self) -> NoiseDistribution:
@@ -1341,9 +1394,23 @@ class VideoDiffusionModel:
             )
         elif self.two_block:
             n_channels = len(out_names)
-            r_mixing = _channel_mixing_matrix(
-                self._full_tau, config.r_kernel, None, pin_endpoints=True
-            )
+            if config.r_kernel == "ou":
+                # one endpoint-pinned OU kernel per r channel
+                r_mixing = torch.stack(
+                    [
+                        _channel_mixing_matrix(
+                            self._full_tau,
+                            "ou",
+                            config.r_kernel_length_scale_for(name),
+                            pin_endpoints=True,
+                        )
+                        for name in out_names
+                    ]
+                )
+            else:
+                r_mixing = _channel_mixing_matrix(
+                    self._full_tau, config.r_kernel, None, pin_endpoints=True
+                ).expand(n_channels, -1, -1)
             d_mixing = _channel_mixing_matrix(
                 self._full_tau,
                 config.d_kernel,
@@ -1359,7 +1426,7 @@ class VideoDiffusionModel:
             # applies a different kernel to each channel independently.
             self._two_block_noise_mixing = torch.cat(
                 [
-                    r_mixing.unsqueeze(0).expand(n_channels, -1, -1),
+                    r_mixing,
                     d_mixing.unsqueeze(0).expand(n_channels, -1, -1),
                 ],
                 dim=0,
