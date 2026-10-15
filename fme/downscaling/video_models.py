@@ -92,6 +92,12 @@ from fme.downscaling.twoblock import (
     d_target,
     null_space_projector,
 )
+from fme.downscaling.v3_baseline import (
+    V3Baseline,
+    V3Normalization,
+    load_v3_baseline,
+    v3_coarse_interior,
+)
 from fme.downscaling.vortex_shift import vortex_shift_interp
 
 CHANNEL_AXIS = 1
@@ -508,6 +514,15 @@ class VideoDiffusionModelConfig:
     vortex_min_depth: float = 5.0
     vortex_taper_cells: float = 6.0  # coarse cells
     vortex_search_cells: float = 10.0  # max endpoint-to-endpoint centre distance
+    # Learned two-block baseline (fme/downscaling/v3_baseline.py): I(tau) is the
+    # coarse (4x4 physical mean) version of a V3 model's 25 km output for the
+    # two coarse endpoint frames (V3: Becker et al., ICLR 2026), pinned to the
+    # inputs at both ends. The V3 weights are frozen, loaded from this path
+    # (written by scripts/v3_baseline/convert_checkpoint.py) and must be
+    # available wherever the diffusion model runs. Like vortex_shift_baseline,
+    # the upsampled baseline is added to the conditioning (changes in_channels:
+    # from-scratch runs only). Requires two_block=True and 9 steps.
+    v3_baseline_checkpoint: str | None = None
     weight_fit_loss_weight: float = 1.0
     condition_encoder_hidden: int = 16
 
@@ -841,6 +856,20 @@ class VideoDiffusionModelConfig:
                     "condition_encoder_hidden must be >= 1, got "
                     f"{self.condition_encoder_hidden}."
                 )
+        if self.v3_baseline_checkpoint is not None:
+            if not self.two_block:
+                raise ValueError("v3_baseline_checkpoint requires two_block=True.")
+            if self.vortex_shift_baseline:
+                raise ValueError(
+                    "v3_baseline_checkpoint and vortex_shift_baseline are mutually "
+                    "exclusive: both replace the linear baseline I(tau)."
+                )
+            if self.n_timesteps != 9:
+                raise ValueError(
+                    "v3_baseline_checkpoint requires n_timesteps=9 (the V3 model "
+                    "decodes the 9 steps between its endpoints), got "
+                    f"{self.n_timesteps}."
+                )
         if self.vortex_shift_baseline:
             if not self.two_block:
                 raise ValueError("vortex_shift_baseline requires two_block=True.")
@@ -1069,8 +1098,8 @@ class VideoDiffusionModelConfig:
             # of n_channels.
             assert coarse_normalizer is not None
             in_channels = 4 * n_channels + n_channels + 1
-            if self.vortex_shift_baseline:
-                in_channels += n_channels  # upsampled translation-aware baseline
+            if self.vortex_shift_baseline or self.v3_baseline_checkpoint is not None:
+                in_channels += n_channels  # upsampled non-linear baseline
             out_channels = 2 * n_channels
             sigma_data = self.two_block_sigma_data_tensor(get_device())
         else:
@@ -1204,6 +1233,17 @@ class VideoDiffusionModel:
         downscale_factor: int | None = None,
     ):
         self.config = config
+        self._v3: V3Baseline | None = None
+        self._v3_norm: V3Normalization | None = None
+        if config.v3_baseline_checkpoint is not None:
+            self._v3, self._v3_norm = load_v3_baseline(
+                config.v3_baseline_checkpoint, get_device()
+            )
+            if set(self._v3_norm.names) != set(config.out_names):
+                raise ValueError(
+                    f"V3 baseline channels {self._v3_norm.names} must match "
+                    f"out_names {config.out_names}."
+                )
         # (1, C, 1, 1, 1) so it broadcasts against the per-channel sigma tensor.
         self.sigma_data = config.sigma_data_tensor(get_device()).reshape(1, -1, 1, 1, 1)
         dist = Distributed.get_instance()
@@ -1803,6 +1843,8 @@ class VideoDiffusionModel:
         """``I(tau)`` on the coarse grid: linear in time, or translation-aware
         near a detected vortex when ``vortex_shift_baseline`` is set.
         """
+        if self._v3 is not None:
+            return self._v3_baseline_interp(coarse_clip)
         if not self.config.vortex_shift_baseline:
             return coarse_temporal_interp(coarse_clip)
         assert self.coarse_normalizer is not None
@@ -1819,6 +1861,38 @@ class VideoDiffusionModel:
             search_cells=self.config.vortex_search_cells,
         )
 
+    @torch.no_grad()
+    def _v3_baseline_interp(self, coarse_clip: torch.Tensor) -> torch.Tensor:
+        """``I(tau)`` from the frozen V3 model: its 25 km output for the two coarse
+        endpoint frames, averaged back to the coarse grid in physical units (so
+        log-transformed channels are averaged as physical values), normalized like
+        ``coarse_clip`` and pinned to the endpoint frames.
+        """
+        assert self._v3 is not None and self._v3_norm is not None
+        assert self.coarse_normalizer is not None
+        norm = self._v3_norm
+        n_times = coarse_clip.shape[-3]
+        if n_times != 9:
+            raise ValueError(f"V3 baseline needs 9 time steps, got {n_times}.")
+        # coarse clip -> log1p space (physical for the other channels), per channel
+        in_space = self.coarse_normalizer.denormalize(
+            self.packer.unpack(coarse_clip, axis=CHANNEL_AXIS)
+        )
+        interior = v3_coarse_interior(
+            self._v3,
+            norm,
+            {name: in_space[name][:, [0, -1]] for name in norm.names},
+            n_steps=n_times,
+        )
+        first = self.packer.unpack(coarse_clip[:, :, :1], axis=CHANNEL_AXIS)
+        last = self.packer.unpack(coarse_clip[:, :, -1:], axis=CHANNEL_AXIS)
+        normalized = self.coarse_normalizer.normalize(interior)
+        frames = {
+            name: torch.cat([first[name], normalized[name], last[name]], dim=1)
+            for name in self.out_names
+        }
+        return self.packer.pack(frames, axis=CHANNEL_AXIS)
+
     def _two_block_condition(
         self,
         fine_clip: torch.Tensor,
@@ -1828,7 +1902,10 @@ class VideoDiffusionModel:
         factor: int,
     ) -> torch.Tensor:
         condition = self._conditioning(fine_clip, r_mask, coarse_upsampled)
-        if self.config.vortex_shift_baseline:
+        if (
+            self.config.vortex_shift_baseline
+            or self.config.v3_baseline_checkpoint is not None
+        ):
             condition = torch.cat(
                 [condition, block_replicate_upsample(interp, factor)],
                 dim=CHANNEL_AXIS,

@@ -24,6 +24,7 @@ from fme.downscaling.noise import (
     LogUniformNoiseDistribution,
 )
 from fme.downscaling.twoblock import coarse_temporal_interp, conservative_downsample
+from fme.downscaling.v3_baseline import V3Baseline, V3Config
 from fme.downscaling.video_models import (
     CHANNEL_AXIS,
     EndpointSuperResolutionConfig,
@@ -1612,6 +1613,144 @@ def test_vortex_shift_baseline_train_and_exact_coarse_recovery():
     coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
     interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
     for name in OUT_NAMES:
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
+def _write_tiny_v3(path, zero_field=False):
+    """A small random V3 baseline checkpoint over OUT_NAMES (var1 in log1p space)."""
+    config = V3Config(
+        n_channels=len(OUT_NAMES),
+        embed_dim=16,
+        num_blocks=(1, 1, 1),
+        depths=(1, 1, 1),
+        num_heads=2,
+        output_dims=8,
+        num_basis=16,
+    )
+    torch.manual_seed(0)
+    model = V3Baseline(config)
+    with torch.no_grad():
+        model.freqs.copy_(torch.randn_like(model.freqs))
+        model.k.fill_(0.05)
+        if zero_field:
+            model.out_conv.weight.zero_()
+            model.out_conv.bias.zero_()
+    torch.save(
+        {
+            "config": config.__dict__,
+            "state_dict": model.state_dict(),
+            "source_step": 0,
+            "normalization": {
+                "names": list(OUT_NAMES),
+                "means": [0.5, 0.2],
+                "stds": [2.0, 0.5],
+                "log_scales": {"var1": 1.0},
+            },
+        },
+        path,
+    )
+    return str(path)
+
+
+def _v3_two_block_model(tmp_path, n_times=9, zero_field=False, **config_kwargs):
+    checkpoint = _write_tiny_v3(tmp_path / "v3.pt", zero_field=zero_field)
+    return _two_block_model(
+        n_times,
+        v3_baseline_checkpoint=checkpoint,
+        log_transform_channels={"var1": 1.0},
+        **config_kwargs,
+    )
+
+
+def _v3_batch(n_times=9, coarse_size=24, factor=2, batch_size=2):
+    return _spatial_paired_batch(
+        batch_size=batch_size,
+        n_times=n_times,
+        fine_height=coarse_size * factor,
+        fine_width=coarse_size * factor,
+        downscale_factor=factor,
+    )
+
+
+def test_v3_baseline_config_validation(tmp_path):
+    checkpoint = _write_tiny_v3(tmp_path / "v3.pt")
+    with pytest.raises(ValueError, match="requires two_block"):
+        _coarse_endpoints_only_model(9, v3_baseline_checkpoint=checkpoint)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _two_block_model(
+            9,
+            v3_baseline_checkpoint=checkpoint,
+            vortex_shift_baseline=True,
+            vortex_slp_channel="var0",
+        )
+    with pytest.raises(ValueError, match="n_timesteps=9"):
+        _two_block_model(5, v3_baseline_checkpoint=checkpoint)
+
+
+def test_v3_baseline_adds_baseline_conditioning_channels(tmp_path):
+    plain = _two_block_model(9, log_transform_channels={"var1": 1.0})
+    v3 = _v3_two_block_model(tmp_path)
+    assert v3.module.module.model.in_conv.conv.in_channels == (
+        plain.module.module.model.in_conv.conv.in_channels + len(OUT_NAMES)
+    )
+
+
+def test_v3_baseline_pins_endpoints_and_is_deterministic(tmp_path):
+    model = _v3_two_block_model(tmp_path)
+    batch = _v3_batch()
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp = model._two_block_interp(coarse)
+    assert interp.shape == coarse.shape
+    assert torch.isfinite(interp).all()
+    assert torch.equal(interp[:, :, 0], coarse[:, :, 0])
+    assert torch.equal(interp[:, :, -1], coarse[:, :, -1])
+    assert torch.equal(interp, model._two_block_interp(coarse))
+    assert not torch.allclose(interp[:, :, 1:-1], coarse[:, :, 1:-1])
+
+
+def test_v3_baseline_with_zero_field_holds_the_nearest_endpoint(tmp_path):
+    """With the Fourier field switched off V3 returns the nearest endpoint, so the
+    baseline must equal that endpoint after all unit conversions (normalizers, the
+    log1p channel, physical 4x4 mean) -- steps 1-4 take the first frame, 5-7 the
+    last."""
+    model = _v3_two_block_model(tmp_path, zero_field=True)
+    batch = _v3_batch()
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp = model._two_block_interp(coarse)
+    expected = torch.cat(
+        [
+            coarse[:, :, :1].expand(-1, -1, 5, -1, -1),
+            coarse[:, :, -1:].expand(-1, -1, 4, -1, -1),
+        ],
+        dim=2,
+    )
+    assert torch.allclose(interp, expected, atol=1e-5)
+
+
+def test_v3_baseline_train_and_exact_coarse_recovery(tmp_path):
+    factor = 2
+    model = _v3_two_block_model(tmp_path)
+    batch = _v3_batch(factor=factor)
+
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    assert all(
+        torch.isfinite(p.grad).all()
+        for p in model.module.parameters()
+        if p.grad is not None
+    )
+    assert all(p.grad is None for p in model._v3.parameters())  # frozen
+
+    generated = model.generate(batch, n_samples=2)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    # exact in model space, so in physical space only for channels without a log
+    # transform
+    for name in [n for n in OUT_NAMES if n != "var1"]:
         down = conservative_downsample(generated[name], factor)
         ref = interp_phys[name].unsqueeze(1).expand_as(down)
         assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
