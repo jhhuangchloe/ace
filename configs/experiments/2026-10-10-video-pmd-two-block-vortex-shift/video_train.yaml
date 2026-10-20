@@ -10,22 +10,20 @@
 # storm centre (fme/downscaling/vortex_shift.py, found from the two coarse
 # endpoint frames only) cut baseline MSE by ~26-35% on those windows.
 #
-# Data: local copy made by prepare_data.py (same dir). TRAIN 2013-01-02 ..
-# 2015-12-31 (3 years, NOT the 9 years of the Beaker runs), VAL/TEST
-# 2022-06-01 .. 2022-09-30. Not directly comparable to the Beaker two-block
-# numbers -- compare against the CONTROL config (same data/steps, flag off).
+# Data: local copy made by prepare_data.py (same dir). TRAIN 2013-01-02 .. 2021-12-31 (the
+# same 9 years as the Beaker runs), VAL/TEST 2022-06-01 .. 2022-09-30 (4 months to keep
+# validation cheap; the Beaker runs validated on all of 2022). Compare against the CONTROL
+# config (same data/steps, flag off).
 #
-# Launch: bash run.sh            (variant "vortex", GPUs 6,7)
+# Launch: bash run.sh            (variant "vortex", GPUs 2,3,4,6,7)
 #         VARIANT=control bash run.sh
 # VARIANT: vortex (vortex_shift_baseline: true).
 experiment_dir: /data/pmd/runs/video-pmd-two-block-vortex-shift
-# Measured on one L40S at 1 sample/GPU: ~1.8 s/step, ~38 GB peak; ~4400 steps
-# per epoch over the 3-year train range at global batch 2 (~2.2 h/epoch on 2 GPUs;
-# ~2.3 h/epoch at global batch 5 on 5 GPUs, ~4400 steps at 1.9 s/step).
-# The first vortex run did 8 epochs at batch 2 then resumed at batch 5 on 5 GPUs.
-# 60 epochs ~ 6 days on 5 GPUs (the original 25km two-block run was ~57 epochs of
-# a 9-year range at batch 4). Validation generates with the full 50-step sampler
-# (~1 min per batch on one GPU), hence the small max_val/test_batches.
+# Measured on one L40S at 1 sample/GPU: ~1.8 s/step, ~38 GB peak. Global batch 5 = 5 GPUs x 1 sample/GPU
+# (the original Beaker run used batch 4). ~13,100 steps per epoch over the 9-year train range = ~6.5 h/epoch
+# on 5 GPUs; 20 epochs ~ 5 days (the original run was ~57 epochs = 937k steps; this is ~28% of that).
+# Validation generates with the full 50-step sampler (~1 min per batch on one GPU), hence the small
+# max_val/test_batches.
 max_epochs: 60
 validate_using_ema: true
 validate_interval: 2
@@ -55,15 +53,15 @@ train_data:
       engine: zarr
       subset:
         start_time: "2013-01-02"
-        stop_time: "2015-12-31"
+        stop_time: "2021-12-31"
   coarse:
     - data_path: /data/pmd/local_data
       file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
       engine: zarr
       subset:
         start_time: "2013-01-02"
-        stop_time: "2015-12-31"
-  batch_size: 5  # global across ranks (5 GPUs x 1 sample/GPU; 2/GPU needs ~75GB, OOMs a 46GB L40S, peak ~38GB at 1/GPU)
+        stop_time: "2021-12-31"
+  batch_size: 5  # global across ranks (5 GPUs x 1 sample/GPU; 2/GPU needs ~75GB, OOMs a 46GB L40S)
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -88,7 +86,7 @@ validation_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 5
+  batch_size: 5  # global across ranks (5 GPUs x 1 sample/GPU; 2/GPU needs ~75GB, OOMs a 46GB L40S)
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -113,7 +111,7 @@ test_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 5
+  batch_size: 5  # global across ranks (5 GPUs x 1 sample/GPU; 2/GPU needs ~75GB, OOMs a 46GB L40S)
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:

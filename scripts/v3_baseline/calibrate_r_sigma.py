@@ -23,7 +23,7 @@ PATCH = (44, 72)
 N_STEPS = 9
 DATA_DIR = "/data/pmd/local_data"
 COARSE_STORE = "2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr"
-TRAIN_STEPS = 8744  # 2013-01-02 .. 2015-12-31 at 3 h
+TRAIN_STEPS = 26280  # 2013-01-02 .. 2021-12-31 at 3 h
 
 
 def main(config_path: str, v3_path: str, n_windows: int = 400, seed: int = 0) -> None:
