@@ -535,6 +535,16 @@ class VideoDiffusionModelConfig:
     # the upsampled baseline is added to the conditioning (changes in_channels:
     # from-scratch runs only). Requires two_block=True and 9 steps.
     v3_baseline_checkpoint: str | None = None
+    # Also use V3's own 25 km output as a baseline for the fine-detail block d (needs
+    # v3_baseline_checkpoint and a downscale factor of 4, V3's scale). The coarse
+    # baseline I(tau) stays the pinned 100 km average of that same output; additionally
+    # its fine-scale part Pi(B), with B the raw V3 trajectory, is the baseline of d:
+    # d is then trained on Pi(x_f - B) and the output is U(I + r_hat) + Pi(B) + d_hat.
+    # Pi(B) has zero coarse average, so exact coarse recovery D(x_hat) = I + r_hat is
+    # unchanged. The network's conditioning becomes the full 25 km baseline
+    # U(I) + Pi(B) (same number of channels). d_sigma_data must be re-estimated (the
+    # residual d is smaller): scripts/v3_baseline/r_statistics.py.
+    v3_detail_baseline: bool = False
     weight_fit_loss_weight: float = 1.0
     condition_encoder_hidden: int = 16
 
@@ -873,6 +883,8 @@ class VideoDiffusionModelConfig:
                     "condition_encoder_hidden must be >= 1, got "
                     f"{self.condition_encoder_hidden}."
                 )
+        if self.v3_detail_baseline and self.v3_baseline_checkpoint is None:
+            raise ValueError("v3_detail_baseline requires v3_baseline_checkpoint.")
         if self.v3_baseline_checkpoint is not None:
             if not self.two_block:
                 raise ValueError("v3_baseline_checkpoint requires two_block=True.")
@@ -1928,12 +1940,30 @@ class VideoDiffusionModel:
             search_cells=self.config.vortex_search_cells,
         )
 
+    def _two_block_baselines(
+        self, coarse_clip: torch.Tensor, factor: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(I, Pi(B))``: the coarse baseline and, with ``v3_detail_baseline``, the
+        fine-scale part of V3's own 25 km trajectory (``None`` otherwise).
+        """
+        if self._v3 is not None and self.config.v3_detail_baseline:
+            return self._v3_baseline_pair(coarse_clip, factor)
+        return self._two_block_interp(coarse_clip), None
+
     @torch.no_grad()
     def _v3_baseline_interp(self, coarse_clip: torch.Tensor) -> torch.Tensor:
+        return self._v3_baseline_pair(coarse_clip, None)[0]
+
+    @torch.no_grad()
+    def _v3_baseline_pair(
+        self, coarse_clip: torch.Tensor, factor: int | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``I(tau)`` from the frozen V3 model: its 25 km output for the two coarse
         endpoint frames, averaged back to the coarse grid in physical units (so
         log-transformed channels are averaged as physical values), normalized like
-        ``coarse_clip`` and pinned to the endpoint frames.
+        ``coarse_clip`` and pinned to the endpoint frames. With ``factor`` (the
+        downscale factor), also returns the fine-scale part ``Pi(B)`` of V3's raw 25 km
+        trajectory ``B``, in the model's normalized fine units (``None`` otherwise).
         """
         assert self._v3 is not None and self._v3_norm is not None
         assert self.coarse_normalizer is not None
@@ -1945,12 +1975,13 @@ class VideoDiffusionModel:
         in_space = self.coarse_normalizer.denormalize(
             self.packer.unpack(coarse_clip, axis=CHANNEL_AXIS)
         )
-        interior = v3_coarse_interior(
-            self._v3,
-            norm,
-            {name: in_space[name][:, [0, -1]] for name in norm.names},
-            n_steps=n_times,
-        )
+        endpoints = {name: in_space[name][:, [0, -1]] for name in norm.names}
+        if factor is not None:
+            interior, fine_raw = v3_coarse_interior(
+                self._v3, norm, endpoints, n_steps=n_times, return_fine=True
+            )
+        else:
+            interior = v3_coarse_interior(self._v3, norm, endpoints, n_steps=n_times)
         first = self.packer.unpack(coarse_clip[:, :, :1], axis=CHANNEL_AXIS)
         last = self.packer.unpack(coarse_clip[:, :, -1:], axis=CHANNEL_AXIS)
         normalized = self.coarse_normalizer.normalize(interior)
@@ -1958,7 +1989,23 @@ class VideoDiffusionModel:
             name: torch.cat([first[name], normalized[name], last[name]], dim=1)
             for name in self.out_names
         }
-        return self.packer.pack(frames, axis=CHANNEL_AXIS)
+        interp = self.packer.pack(frames, axis=CHANNEL_AXIS)
+        if factor is None:
+            return interp, None
+        coarse_h = coarse_clip.shape[-2]
+        if fine_raw[norm.names[0]].shape[-2] != coarse_h * factor:
+            raise ValueError(
+                "v3_detail_baseline needs the downscale factor to equal V3's scale "
+                f"({fine_raw[norm.names[0]].shape[-2] // coarse_h}), got {factor}."
+            )
+        # V3's fine output is in the model's fine normalization space (log1p where
+        # configured); express it in the model's normalized fine units and keep
+        # only its fine-scale part
+        fine_norm = self.normalizer.normalize({n: fine_raw[n] for n in self.out_names})
+        detail = null_space_projector(
+            self.packer.pack(fine_norm, axis=CHANNEL_AXIS), factor
+        )
+        return interp, detail
 
     def _two_block_condition(
         self,
@@ -1967,16 +2014,17 @@ class VideoDiffusionModel:
         coarse_upsampled: torch.Tensor,
         interp: torch.Tensor,
         factor: int,
+        detail: torch.Tensor | None = None,
     ) -> torch.Tensor:
         condition = self._conditioning(fine_clip, r_mask, coarse_upsampled)
         if (
             self.config.vortex_shift_baseline
             or self.config.v3_baseline_checkpoint is not None
         ):
-            condition = torch.cat(
-                [condition, block_replicate_upsample(interp, factor)],
-                dim=CHANNEL_AXIS,
-            )
+            baseline = block_replicate_upsample(interp, factor)
+            if detail is not None:
+                baseline = baseline + detail  # the full 25 km baseline
+            condition = torch.cat([condition, baseline], dim=CHANNEL_AXIS)
         return condition
 
     def _train_on_batch_two_block(
@@ -1998,9 +2046,11 @@ class VideoDiffusionModel:
         batch_size, n_channels, n_times, fine_h, fine_w = fine_clip.shape
         factor = fine_h // coarse_clip.shape[-2]
 
-        interp = self._two_block_interp(coarse_clip)
+        interp, detail = self._two_block_baselines(coarse_clip, factor)
         r = coarse_clip - interp
         d = d_target(fine_clip, coarse_clip, factor)
+        if detail is not None:
+            d = d - detail  # d is the residual against V3's own fine-scale prediction
         r_fine = block_replicate_upsample(r, factor)
         residual = torch.cat([r_fine, d], dim=CHANNEL_AXIS)  # (B, 2C, T, Hf, Wf)
 
@@ -2019,7 +2069,7 @@ class VideoDiffusionModel:
         # is False, validated in __post_init__) -- only coarse_upsampled matters,
         # masked to the endpoint positions via coarse_endpoints_only.
         condition = self._two_block_condition(
-            fine_clip, r_mask, coarse_upsampled, interp, factor
+            fine_clip, r_mask, coarse_upsampled, interp, factor, detail
         )
 
         r_mixing, d_mixing, weight_fit_loss = (
@@ -2058,6 +2108,8 @@ class VideoDiffusionModel:
             denoised_r_fine, denoised_d = denoised.split(n_channels, dim=CHANNEL_AXIS)
             r_hat = conservative_downsample(denoised_r_fine, factor) * r_mask
             d_hat = denoised_d * d_mask
+            if detail is not None:
+                d_hat = d_hat + detail
             full_norm = assemble_fine_output(interp, r_hat, d_hat, factor)
             prediction = self._denormalize_invert(full_norm)
 
@@ -2277,7 +2329,7 @@ class VideoDiffusionModel:
         batch_size, n_channels, n_times, fine_h, fine_w = fine_clip.shape
         factor = fine_h // coarse_clip.shape[-2]
 
-        interp = self._two_block_interp(coarse_clip)
+        interp, detail = self._two_block_baselines(coarse_clip, factor)
         r_mask = _interior_mask(n_times, fine_clip.device, endpoints_observed=True)
         d_mask = _interior_mask(n_times, fine_clip.device, endpoints_observed=False)
         mask = torch.cat(
@@ -2290,7 +2342,7 @@ class VideoDiffusionModel:
         coarse_h, coarse_w = coarse_clip.shape[-2:]
         coarse_upsampled = block_replicate_upsample(coarse_clip, factor)
         condition = self._two_block_condition(
-            fine_clip, r_mask, coarse_upsampled, interp, factor
+            fine_clip, r_mask, coarse_upsampled, interp, factor, detail
         )
         # Computed on the un-repeated batch: condition features/g_phi only
         # depend on the true condition c, not the ensemble size.
@@ -2303,6 +2355,8 @@ class VideoDiffusionModel:
 
         condition = repeat(condition)
         interp = repeat(interp)
+        if detail is not None:
+            detail = repeat(detail)
         day_of_year = repeat(day_of_year)
         second_of_day = repeat(second_of_day)
         mask_b = mask.expand(batch_size * n_samples, 2 * n_channels, n_times, 1, 1)
@@ -2382,6 +2436,8 @@ class VideoDiffusionModel:
         )
         denoised_r_fine, denoised_d = residual.split(n_channels, dim=CHANNEL_AXIS)
         r_hat = conservative_downsample(denoised_r_fine, factor)
+        if detail is not None:
+            denoised_d = denoised_d + detail
         full_norm = assemble_fine_output(interp, r_hat, denoised_d, factor)
         generated = self._denormalize_invert(full_norm)
         return {

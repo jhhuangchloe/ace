@@ -502,7 +502,8 @@ def v3_coarse_interior(
     norm: V3Normalization,
     endpoints: dict[str, torch.Tensor],
     n_steps: int = N_STEPS,
-) -> dict[str, torch.Tensor]:
+    return_fine: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Coarse-grid interior frames implied by V3's fine-grid output.
 
     Args:
@@ -511,11 +512,14 @@ def v3_coarse_interior(
         endpoints: Per channel ``(B, 2, h, w)`` first and last coarse frames, in log1p
             space for the channels in ``norm.log_scales`` (physical otherwise).
         n_steps: Total time steps including the two endpoints.
+        return_fine: Also return V3's own fine-grid output at all ``n_steps`` steps.
 
     Returns:
         Per channel ``(B, n_steps - 2, h, w)`` interior frames in the same space as
         the input: the fine output is converted to physical values (inverting the log
-        transform), averaged over each coarse cell, and transformed back.
+        transform), averaged over each coarse cell, and transformed back. With
+        ``return_fine``, a second dict holds V3's raw fine output per channel,
+        ``(B, n_steps, 4h, 4w)``, in the input space (log1p where the input is).
     """
     ends = torch.stack(
         [
@@ -524,7 +528,9 @@ def v3_coarse_interior(
         ],
         dim=-1,
     )
-    fine = model(ends.float(), steps=range(1, n_steps - 1))
+    steps = range(n_steps) if return_fine else range(1, n_steps - 1)
+    fine_all = model(ends.float(), steps=steps)
+    fine = fine_all[:, 1:-1] if return_fine else fine_all
     coarse_h, coarse_w = ends.shape[2:4]
     factor = fine.shape[-3] // coarse_h
     interior = {}
@@ -533,8 +539,14 @@ def v3_coarse_interior(
         scale = norm.log_scales.get(name)
         if scale is not None:
             value = torch.expm1(value).clamp(min=0.0) / scale
-        batch, steps = value.shape[:2]
-        value = value.reshape(batch, steps, coarse_h, factor, coarse_w, factor)
+        batch, n_frames = value.shape[:2]
+        value = value.reshape(batch, n_frames, coarse_h, factor, coarse_w, factor)
         value = value.mean(dim=(3, 5))
         interior[name] = torch.log1p(value * scale) if scale is not None else value
-    return interior
+    if not return_fine:
+        return interior
+    raw = {
+        name: fine_all[..., i] * norm.stds[i] + norm.means[i]
+        for i, name in enumerate(norm.names)
+    }
+    return interior, raw

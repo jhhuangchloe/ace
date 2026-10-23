@@ -1869,3 +1869,70 @@ def test_ou_r_kernel_train_and_exact_coarse_recovery():
         ref = interp_phys[name].unsqueeze(1).expand_as(down)
         assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
         assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
+def _v3_detail_model(tmp_path, zero_field=False, **config_kwargs):
+    return _v3_two_block_model(
+        tmp_path, zero_field=zero_field, v3_detail_baseline=True, **config_kwargs
+    )
+
+
+def _v3_detail_batch(coarse_size=12, batch_size=2):
+    # V3 upsamples by 4, so the detail baseline needs a 4x downscale factor
+    return _v3_batch(coarse_size=coarse_size, factor=4, batch_size=batch_size)
+
+
+def test_v3_detail_baseline_requires_a_v3_checkpoint():
+    with pytest.raises(ValueError, match="requires v3_baseline_checkpoint"):
+        _two_block_model(9, v3_detail_baseline=True)
+
+
+def test_v3_detail_baseline_rejects_other_downscale_factors(tmp_path):
+    model = _v3_detail_model(tmp_path)
+    batch = _v3_batch(coarse_size=12, factor=2)
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    with pytest.raises(ValueError, match="downscale factor"):
+        model._two_block_baselines(coarse, 2)
+
+
+def test_v3_detail_baseline_is_zero_when_v3_adds_no_detail(tmp_path):
+    """With V3's field switched off its fine output is the upsampled nearest endpoint,
+    which has no fine-scale part: Pi(B) must vanish and I must match the coarse-only
+    baseline."""
+    model = _v3_detail_model(tmp_path, zero_field=True)
+    batch = _v3_detail_batch()
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp, detail = model._two_block_baselines(coarse, 4)
+    assert detail is not None and detail.abs().max() < 1e-4
+    assert torch.allclose(interp, model._two_block_interp(coarse), atol=1e-6)
+
+
+def test_v3_detail_baseline_has_no_coarse_average(tmp_path):
+    model = _v3_detail_model(tmp_path)
+    batch = _v3_detail_batch()
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp, detail = model._two_block_baselines(coarse, 4)
+    assert detail.shape[-2:] == (48, 48) and detail.abs().max() > 1e-3
+    assert conservative_downsample(detail, 4).abs().max() < 1e-5  # D Pi = 0
+    # the coarse baseline is the same with and without the detail option
+    plain = _v3_two_block_model(tmp_path)
+    assert torch.allclose(interp, plain._two_block_interp(coarse), atol=1e-6)
+
+
+def test_v3_detail_baseline_train_and_exact_coarse_recovery(tmp_path):
+    factor = 4
+    model = _v3_detail_model(tmp_path)
+    batch = _v3_detail_batch(coarse_size=8, batch_size=1)  # smallest patch V3 accepts
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    assert all(p.grad is None for p in model._v3.parameters())
+
+    generated = model.generate(batch, n_samples=1)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    for name in [n for n in OUT_NAMES if n != "var1"]:  # exact in model space
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
