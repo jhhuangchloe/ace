@@ -23,7 +23,7 @@
 # V3 weights: v3_baseline_9yr.pt (V3 trained on the same 9 years, 2026-10-22). r_sigma_data_by_channel and
 # the OU lengths below were re-estimated for it with scripts/v3_baseline/ (r_statistics.py: 1000 train + 1000
 # held-out patches; calibrate_r_sigma.py on 400 windows agrees within 6%; fit_r_kernel.py: per-channel OU misfit 0.087).
-experiment_dir: /data/pmd/runs/video-pmd-two-block-v3-baseline
+experiment_dir: /data/pmd/runs/video-pmd-two-block-v3-baseline-detail
 # Measured on one L40S at 1 sample/GPU: ~2.3 s/step (incl. ~0.4 s V3), ~38 GB peak. Global batch 5 = 5 GPUs x 1 sample/GPU
 # (the original Beaker run used batch 4). ~13,100 steps per epoch over the 9-year train range = ~8.4 h/epoch
 # on 5 GPUs; 20 epochs ~ 7 days (the original run was ~57 epochs = 937k steps; this is ~28% of that).
@@ -42,7 +42,7 @@ logging:
   log_to_wandb: false  # no W&B key on this machine; set true + export WANDB_API_KEY to enable
   log_to_file: true
   project: ace-temporal-interp
-  name: local-25km-100km-two-block-v3-baseline
+  name: local-25km-100km-two-block-v3-baseline-detail
   entity: ai2cm
 optimization:
   lr: 0.0001
@@ -152,6 +152,10 @@ model:
   # must exist at this path wherever the model runs (written by
   # scripts/v3_baseline/convert_checkpoint.py from the JAX checkpoint).
   v3_baseline_checkpoint: /data/pmd/v3_baseline/v3_baseline_9yr.pt
+  # 25 km baseline: V3's own fine-scale prediction Pi(B) is also the baseline of the detail block d
+  # (d = Pi(x_f - B); output U(I + r) + Pi(B) + d). Coarse consistency stays exact. d_sigma_data below
+  # is re-estimated for this smaller residual (scripts/v3_baseline/r_statistics.py).
+  v3_detail_baseline: true
   # temporal_noise_correlation must stay at its "independent" default (not
   # set here) -- two_block uses r_kernel/d_kernel instead (validated in
   # __post_init__).
@@ -172,12 +176,15 @@ model:
     PRMSL: 0.0716
     PRATEsfc: 0.4566
     air_temperature_at_two_meters: 0.0568
+  # d is now the residual against V3's own fine-scale prediction, so it is smaller: RMS of the new
+  # target over 2 x 1250 train / held-out patches (all 9 frames), scripts/v3_baseline/r_statistics.py.
+  # Ratio to the plain d block: 0.82 / 0.83 / 0.65 / 0.88 / 0.82 (u, v, PRMSL, precip, T2m).
   d_sigma_data_by_channel:
-    eastward_wind_at_ten_meters: 0.1617
-    northward_wind_at_ten_meters: 0.1892
-    PRMSL: 0.0586
-    PRATEsfc: 0.4254
-    air_temperature_at_two_meters: 0.0529
+    eastward_wind_at_ten_meters: 0.1317
+    northward_wind_at_ten_meters: 0.1581
+    PRMSL: 0.0266
+    PRATEsfc: 0.3965
+    air_temperature_at_two_meters: 0.0431
   log_transform_channels:
     PRATEsfc: 86400.0  # precip modeled in log1p(mm/day) space
   out_names:
