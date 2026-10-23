@@ -1,0 +1,212 @@
+# Two-block (r, d) video PMD with a translation-aware baseline, trained
+# LOCALLY on 2 GPUs (no Beaker). 100km endpoints in, full 25km trajectory out.
+#
+# Motivation (measured on real paired data around tropical cyclones, tracks
+# 789/795/829): of the interior-frame error of the current two-block baseline
+# (linear temporal interpolation of the coarse endpoints, then block-replicate
+# upsample), 67-90% is the temporal term U(x_c - I) -- linear interpolation
+# cross-fades a moving vortex instead of translating it -- and only 10-32% is
+# spatial blockiness. Translating the vortex anomaly to the interpolated
+# storm centre (fme/downscaling/vortex_shift.py, found from the two coarse
+# endpoint frames only) cut baseline MSE by ~26-35% on those windows.
+#
+# Data: local copy made by prepare_data.py (same dir). TRAIN 2013-01-02 ..
+# 2015-12-31 (3 years, NOT the 9 years of the Beaker runs), VAL/TEST
+# 2022-06-01 .. 2022-09-30. Not directly comparable to the Beaker two-block
+# numbers -- compare against the CONTROL config (same data/steps, flag off).
+#
+# Launch: bash run.sh            (variant "vortex", GPUs 6,7)
+#         VARIANT=control bash run.sh
+# VARIANT: vortex (vortex_shift_baseline: true).
+experiment_dir: /data/pmd/runs/video-pmd-two-block-vortex-shift
+# Measured on one L40S at 1 sample/GPU: ~1.8 s/step, ~38 GB peak; ~4400 steps
+# per epoch over the 3-year train range at global batch 2 (~2.2 h/epoch on 2 GPUs;
+# ~2.3 h/epoch at global batch 5 on 5 GPUs, ~4400 steps at 1.9 s/step).
+# The first vortex run did 8 epochs at batch 2 then resumed at batch 5 on 5 GPUs.
+# 60 epochs ~ 6 days on 5 GPUs (the original 25km two-block run was ~57 epochs of
+# a 9-year range at batch 4). Validation generates with the full 50-step sampler
+# (~1 min per batch on one GPU), hence the small max_val/test_batches.
+max_epochs: 60
+validate_using_ema: true
+validate_interval: 2
+test_interval: 10
+max_val_batches: 8
+max_test_batches: 8
+generate_n_samples: 1
+log_loss_vs_noise: true
+logging:
+  log_to_screen: true
+  log_to_wandb: false  # no W&B key on this machine; set true + export WANDB_API_KEY to enable
+  log_to_file: true
+  project: ace-temporal-interp
+  name: local-25km-100km-two-block-vortex-shift
+  entity: ai2cm
+optimization:
+  lr: 0.0001
+ema:
+  decay: 0.9999
+coarse_patch_extent_lat: 44
+coarse_patch_extent_lon: 72
+train_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2015-12-31"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2015-12-31"
+  batch_size: 4  # TMP: global, 4 GPUs x 1 sample/GPU
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+validation_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 4  # TMP: global, 4 GPUs x 1 sample/GPU
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+test_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 4  # TMP: global, 4 GPUs x 1 sample/GPU
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+model:
+  n_timesteps: 9
+  model_channels: 128
+  n_heads: 8
+  num_freqs: 4
+  backbone: simple
+  noise_embedding_type: positional
+  channel_mult: [1, 2, 2, 2, 2]
+  num_blocks: 2
+  attention_levels: [3, 4]
+  sigma_min: 0.002
+  sigma_max: 150.0
+  churn: 0.0
+  num_diffusion_generation_steps: 50
+  # Two-block mode: see the header comment above and
+  # VideoDiffusionModelConfig.two_block's docstring in
+  # fme/downscaling/video_models.py.
+  endpoints_observed: false
+  coarse_endpoints_only: true
+  two_block: true
+  r_kernel: brownian_bridge
+  d_kernel: independent
+  # Translation-aware baseline (vortex_shift.py). Adds n_channels conditioning
+  # channels, so from-scratch only.
+  vortex_shift_baseline: true
+  vortex_slp_channel: PRMSL
+  vortex_min_depth: 5.0      # hPa below the surrounding ring to count as a vortex
+  vortex_taper_cells: 6.0    # coarse (100km) cells
+  vortex_search_cells: 10.0  # max endpoint-to-endpoint centre distance, coarse cells
+  # temporal_noise_correlation must stay at its "independent" default (not
+  # set here) -- two_block uses r_kernel/d_kernel instead (validated in
+  # __post_init__).
+  # Calibrated from scripts/video_pmd_eval/residual_calibration_diagnostic.py
+  # (run via run_residual_calibration_diagnostic.sh on real weka data,
+  # 2026-08-26): std of r_target/d_target in the model's own normalized
+  # units, pooled over 8 seasonal windows, global grid. Previously left at
+  # the 1.0 default -- per the single-block configs' own experience
+  # (toy/compute_residual_std.py), this calibration is a make-or-break item
+  # for EDM preconditioning/loss weighting, not a "fix later if training
+  # behaves unexpectedly" afterthought.
+  r_sigma_data_by_channel:
+    eastward_wind_at_ten_meters: 0.3201
+    northward_wind_at_ten_meters: 0.4415
+    PRMSL: 0.1783
+    PRATEsfc: 0.6825
+    air_temperature_at_two_meters: 0.1229
+  d_sigma_data_by_channel:
+    eastward_wind_at_ten_meters: 0.1617
+    northward_wind_at_ten_meters: 0.1892
+    PRMSL: 0.0586
+    PRATEsfc: 0.4254
+    air_temperature_at_two_meters: 0.0529
+  log_transform_channels:
+    PRATEsfc: 86400.0  # precip modeled in log1p(mm/day) space
+  out_names:
+    - eastward_wind_at_ten_meters
+    - northward_wind_at_ten_meters
+    - PRMSL
+    - PRATEsfc
+    - air_temperature_at_two_meters
+  normalization:  # fine (25km), train-only, global domain -- toy/compute_norm_stats_25km.py
+    means:
+      eastward_wind_at_ten_meters: -0.036200
+      northward_wind_at_ten_meters: 0.170470
+      PRMSL: 1008.160699
+      PRATEsfc: 0.484074   # log1p(PRATEsfc * 86400) space, matching log_transform_channels
+      air_temperature_at_two_meters: 279.675977
+    stds:
+      eastward_wind_at_ten_meters: 5.627319
+      northward_wind_at_ten_meters: 4.692752
+      PRMSL: 15.043594
+      PRATEsfc: 0.850964
+      air_temperature_at_two_meters: 20.455977
+  coarse_normalization:  # coarse (100km), train-only, global domain -- reused verbatim
+    # from the stage-1 config: verified 2026-07-24 that the 100km store is
+    # byte-identical to the dataset those stats were computed from.
+    means:
+      eastward_wind_at_ten_meters: -0.036135
+      northward_wind_at_ten_meters: 0.186555
+      PRMSL: 1008.281106
+      PRATEsfc: 0.557112
+      air_temperature_at_two_meters: 279.3386
+    stds:
+      eastward_wind_at_ten_meters: 5.548626
+      northward_wind_at_ten_meters: 4.603089
+      PRMSL: 14.908773
+      PRATEsfc: 0.871331
+      air_temperature_at_two_meters: 20.2363

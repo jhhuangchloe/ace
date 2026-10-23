@@ -20,10 +20,9 @@
 # VAL/TEST 2022-06-01 .. 2022-09-30.
 #
 # Launch: bash run.sh   (see the header of run.sh for GPUs / batch size)
-# !! The V3 weights below must come from a V3 trained on the SAME 9 years (see run.sh for the
-# !! steps). Until then this file points at a path that does not exist, so run.sh refuses to
-# !! start; r_sigma_data_by_channel (and the OU lengths in video_train_ou.yaml) are the values
-# !! for the old 3-year V3 and MUST be re-estimated with scripts/v3_baseline/ afterwards.
+# V3 weights: v3_baseline_9yr.pt (V3 trained on the same 9 years, 2026-10-22). r_sigma_data_by_channel and
+# the OU lengths below were re-estimated for it with scripts/v3_baseline/ (r_statistics.py: 1000 train + 1000
+# held-out patches; calibrate_r_sigma.py on 400 windows agrees within 6%; fit_r_kernel.py: per-channel OU misfit 0.087).
 experiment_dir: /data/pmd/runs/video-pmd-two-block-v3-baseline
 # Measured on one L40S at 1 sample/GPU: ~2.3 s/step (incl. ~0.4 s V3), ~38 GB peak. Global batch 5 = 5 GPUs x 1 sample/GPU
 # (the original Beaker run used batch 4). ~13,100 steps per epoch over the 9-year train range = ~8.4 h/epoch
@@ -164,15 +163,15 @@ model:
   # (toy/compute_residual_std.py), this calibration is a make-or-break item
   # for EDM preconditioning/loss weighting, not a "fix later if training
   # behaves unexpectedly" afterthought.
-  # Re-calibrated for the V3 baseline (std of r in the coarse-normalized units, interior
-  # steps, 400 random training windows): scripts/v3_baseline/calibrate_r_sigma.py.
+  # Re-calibrated for the 9-year V3 baseline (std of r in the coarse-normalized units, interior
+  # steps, mean of train and held-out RMS): scripts/v3_baseline/r_statistics.py.
   # The linear-baseline values were 0.3201 / 0.4415 / 0.1783 / 0.6825 / 0.1229.
   r_sigma_data_by_channel:
-    eastward_wind_at_ten_meters: 0.1492
-    northward_wind_at_ten_meters: 0.1809
-    PRMSL: 0.0707
-    PRATEsfc: 0.4623
-    air_temperature_at_two_meters: 0.0536
+    eastward_wind_at_ten_meters: 0.1521
+    northward_wind_at_ten_meters: 0.1843
+    PRMSL: 0.0716
+    PRATEsfc: 0.4566
+    air_temperature_at_two_meters: 0.0568
   d_sigma_data_by_channel:
     eastward_wind_at_ten_meters: 0.1617
     northward_wind_at_ten_meters: 0.1892

@@ -40,6 +40,9 @@ VARIABLES = [
 ]
 COORDS = ["time", "latitude", "longitude", "grid_xt_bnds", "grid_yt_bnds"]
 T0 = dt.datetime(2013, 1, 2, 0)  # time[0]; 3-hourly
+# Socket timeout: without it a stalled connection hangs a worker forever (seen: all 6 workers
+# idle for hours); with it the retry loop in fetch() reopens the connection.
+TIMEOUT_S = 60
 
 
 def step(date: str) -> int:
@@ -50,7 +53,7 @@ def list_bucket() -> list[dict]:
     url: str | None = f"{API}?recursive=true&limit=10000&sort=path"
     items: list[dict] = []
     while url:
-        with urllib.request.urlopen(url) as resp:
+        with urllib.request.urlopen(url, timeout=TIMEOUT_S) as resp:
             items += json.load(resp)
             link = resp.headers.get("link") or ""
         url = link.split("<")[1].split(">")[0] if 'rel="next"' in link else None
@@ -91,7 +94,7 @@ def fetch(e, out_dir) -> int:
         try:
             tmp = dest + ".part"
             with (
-                urllib.request.urlopen(f"{RESOLVE}/{e['path']}") as r,
+                urllib.request.urlopen(f"{RESOLVE}/{e['path']}", timeout=TIMEOUT_S) as r,
                 open(tmp, "wb") as f,
             ):
                 shutil.copyfileobj(r, f, 1 << 20)

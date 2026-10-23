@@ -1,0 +1,227 @@
+# Two-block (r, d) video PMD with a LEARNED temporal baseline (V3), trained locally.
+# 100km endpoints in, full 25km trajectory out -- same I/O as the linear-baseline
+# two-block runs: only the baseline I(tau) changes.
+#
+# I(tau) is the coarse (4x4 physical mean) version of the 25 km trajectory that a frozen
+# V3 model (Becker et al., ICLR 2026; adapted in ~/Projects/v3, branch climate-adapt;
+# PyTorch port in fme/downscaling/v3_baseline.py) predicts from the two coarse endpoint
+# frames, pinned to the inputs at both ends. On the 22 real TC windows its coarse
+# interior-frame error is ~6.7x (PRMSL) / ~3x (winds) below linear interpolation, and
+# the std of r = x_c - I(tau) drops to 0.36-0.55x of the linear baseline's (see
+# r_sigma_data_by_channel below, from scripts/v3_baseline/calibrate_r_sigma.py).
+# Caveat: part of that gain is the daily pressure/wind cycle, which this model already
+# gets from its calendar inputs -- the comparison against the linear CONTROL
+# (../2026-10-10-video-pmd-two-block-vortex-shift/video_train_control.yaml, same
+# data/steps) is what tells whether the better baseline helps the final model.
+#
+# Data: local copy made by ../2026-10-10-video-pmd-two-block-vortex-shift/prepare_data.py.
+# TRAIN 2013-01-02 .. 2021-12-31 (the V3 baseline must be trained on the same years: its
+# train_climate.py defaults),
+# VAL/TEST 2022-06-01 .. 2022-09-30.
+#
+# Launch: bash run.sh   (see the header of run.sh for GPUs / batch size)
+# V3 weights: v3_baseline_9yr.pt (V3 trained on the same 9 years, 2026-10-22). r_sigma_data_by_channel and
+# the OU lengths below were re-estimated for it with scripts/v3_baseline/ (r_statistics.py: 1000 train + 1000
+# held-out patches; calibrate_r_sigma.py on 400 windows agrees within 6%; fit_r_kernel.py: per-channel OU misfit 0.087).
+experiment_dir: /data/pmd/runs/video-pmd-two-block-v3-baseline-ou
+# Measured on one L40S at 1 sample/GPU: ~2.3 s/step (incl. ~0.4 s V3), ~38 GB peak. Global batch 5 = 5 GPUs x 1 sample/GPU
+# (the original Beaker run used batch 4). ~13,100 steps per epoch over the 9-year train range = ~8.4 h/epoch
+# on 5 GPUs; 20 epochs ~ 7 days (the original run was ~57 epochs = 937k steps; this is ~28% of that).
+# Validation generates with the full 50-step sampler (~1 min per batch on one GPU), hence the small
+# max_val/test_batches.
+max_epochs: 60
+validate_using_ema: true
+validate_interval: 2
+test_interval: 10
+max_val_batches: 8
+max_test_batches: 8
+generate_n_samples: 1
+log_loss_vs_noise: true
+logging:
+  log_to_screen: true
+  log_to_wandb: false  # no W&B key on this machine; set true + export WANDB_API_KEY to enable
+  log_to_file: true
+  project: ace-temporal-interp
+  name: local-25km-100km-two-block-v3-baseline-ou
+  entity: ai2cm
+optimization:
+  lr: 0.0001
+ema:
+  decay: 0.9999
+coarse_patch_extent_lat: 44
+coarse_patch_extent_lon: 72
+train_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2021-12-31"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2021-12-31"
+  batch_size: 6  # TMP: global, 3 GPUs (0,1,7) x 2 samples/GPU
+  num_data_workers: 1  # TMP: reduced from 4 (host hit the system-wide open-file limit)
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+validation_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 6  # TMP: global, 3 GPUs (0,1,7) x 2 samples/GPU
+  num_data_workers: 1  # TMP: reduced from 4 (host hit the system-wide open-file limit)
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+test_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 6  # TMP: global, 3 GPUs (0,1,7) x 2 samples/GPU
+  num_data_workers: 1  # TMP: reduced from 4 (host hit the system-wide open-file limit)
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+model:
+  n_timesteps: 9
+  model_channels: 128
+  n_heads: 8
+  num_freqs: 4
+  backbone: simple
+  noise_embedding_type: positional
+  channel_mult: [1, 2, 2, 2, 2]
+  num_blocks: 2
+  attention_levels: [3, 4]
+  sigma_min: 0.002
+  sigma_max: 150.0
+  churn: 0.0
+  num_diffusion_generation_steps: 50
+  # Two-block mode: see the header comment above and
+  # VideoDiffusionModelConfig.two_block's docstring in
+  # fme/downscaling/video_models.py.
+  endpoints_observed: false
+  coarse_endpoints_only: true
+  two_block: true
+  # Endpoint-pinned OU kernel per r channel instead of the Brownian bridge. With the V3
+  # baseline r decorrelates faster than a bridge (relative misfit of the interior
+  # correlation matrix 0.33 for the bridge, 0.10 with these lengths); lengths are in units
+  # of the 24 h clip, fitted per channel on 500 train + 500 held-out patches (r_cov fit of
+  # the real training pipeline, scripts/v3_baseline/).
+  r_kernel: ou
+  r_kernel_length_scale_by_channel:
+    eastward_wind_at_ten_meters: 0.225
+    northward_wind_at_ten_meters: 0.225
+    PRMSL: 0.375
+    PRATEsfc: 0.2
+    air_temperature_at_two_meters: 0.275
+  d_kernel: independent
+  # Learned baseline (fme/downscaling/v3_baseline.py). Adds n_channels conditioning
+  # channels (the upsampled baseline), so from-scratch only. The V3 weights are frozen and
+  # must exist at this path wherever the model runs (written by
+  # scripts/v3_baseline/convert_checkpoint.py from the JAX checkpoint).
+  v3_baseline_checkpoint: /data/pmd/v3_baseline/v3_baseline_9yr.pt
+  # temporal_noise_correlation must stay at its "independent" default (not
+  # set here) -- two_block uses r_kernel/d_kernel instead (validated in
+  # __post_init__).
+  # Calibrated from scripts/video_pmd_eval/residual_calibration_diagnostic.py
+  # (run via run_residual_calibration_diagnostic.sh on real weka data,
+  # 2026-08-26): std of r_target/d_target in the model's own normalized
+  # units, pooled over 8 seasonal windows, global grid. Previously left at
+  # the 1.0 default -- per the single-block configs' own experience
+  # (toy/compute_residual_std.py), this calibration is a make-or-break item
+  # for EDM preconditioning/loss weighting, not a "fix later if training
+  # behaves unexpectedly" afterthought.
+  # Re-calibrated for the 9-year V3 baseline (std of r in the coarse-normalized units, interior
+  # steps, mean of train and held-out RMS): scripts/v3_baseline/r_statistics.py.
+  # The linear-baseline values were 0.3201 / 0.4415 / 0.1783 / 0.6825 / 0.1229.
+  r_sigma_data_by_channel:
+    eastward_wind_at_ten_meters: 0.1521
+    northward_wind_at_ten_meters: 0.1843
+    PRMSL: 0.0716
+    PRATEsfc: 0.4566
+    air_temperature_at_two_meters: 0.0568
+  d_sigma_data_by_channel:
+    eastward_wind_at_ten_meters: 0.1617
+    northward_wind_at_ten_meters: 0.1892
+    PRMSL: 0.0586
+    PRATEsfc: 0.4254
+    air_temperature_at_two_meters: 0.0529
+  log_transform_channels:
+    PRATEsfc: 86400.0  # precip modeled in log1p(mm/day) space
+  out_names:
+    - eastward_wind_at_ten_meters
+    - northward_wind_at_ten_meters
+    - PRMSL
+    - PRATEsfc
+    - air_temperature_at_two_meters
+  normalization:  # fine (25km), train-only, global domain -- toy/compute_norm_stats_25km.py
+    means:
+      eastward_wind_at_ten_meters: -0.036200
+      northward_wind_at_ten_meters: 0.170470
+      PRMSL: 1008.160699
+      PRATEsfc: 0.484074   # log1p(PRATEsfc * 86400) space, matching log_transform_channels
+      air_temperature_at_two_meters: 279.675977
+    stds:
+      eastward_wind_at_ten_meters: 5.627319
+      northward_wind_at_ten_meters: 4.692752
+      PRMSL: 15.043594
+      PRATEsfc: 0.850964
+      air_temperature_at_two_meters: 20.455977
+  coarse_normalization:  # coarse (100km), train-only, global domain -- reused verbatim
+    # from the stage-1 config: verified 2026-07-24 that the 100km store is
+    # byte-identical to the dataset those stats were computed from.
+    means:
+      eastward_wind_at_ten_meters: -0.036135
+      northward_wind_at_ten_meters: 0.186555
+      PRMSL: 1008.281106
+      PRATEsfc: 0.557112
+      air_temperature_at_two_meters: 279.3386
+    stds:
+      eastward_wind_at_ten_meters: 5.548626
+      northward_wind_at_ten_meters: 4.603089
+      PRMSL: 14.908773
+      PRATEsfc: 0.871331
+      air_temperature_at_two_meters: 20.2363
