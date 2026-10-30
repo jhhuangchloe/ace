@@ -6,7 +6,8 @@
 #   STAGE=scratch GPUS=1,3 bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh  # control
 #
 # Knobs: STAGE (pretrain|finetune|scratch), GPUS="0,2" (comma list; configs use global batch_size
-# 32, so 1, 2, 4, 8, 16 or 32 GPUs; 16 per GPU needs ~34 GB), ENV_NAME=fme, CONFIG=<path> to override the config.
+# 48, so 1, 2, 3, 4, 6, 8, ... GPUs; 24 per GPU needs ~51 GB), ENV_NAME=fme, CONFIG=<path> to override
+# the config.
 # The data must already be local: ../2026-10-10-video-pmd-two-block-vortex-shift/prepare_data.py.
 set -euo pipefail
 

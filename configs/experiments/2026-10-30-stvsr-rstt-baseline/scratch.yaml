@@ -47,7 +47,7 @@ train_data:
       subset:
         start_time: "2013-01-02"
         stop_time: "2021-12-31"
-  batch_size: 32  # global across ranks: 2 GPUs x 16 (~34 GB/GPU est.; per-sample speed is flat beyond ~4)
+  batch_size: 48  # global across ranks: 2 GPUs x 24 (~51 GB/GPU est.; 32/GPU would need ~68 GB)
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -72,7 +72,7 @@ validation_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 32
+  batch_size: 48
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -97,7 +97,7 @@ test_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 32
+  batch_size: 48
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
