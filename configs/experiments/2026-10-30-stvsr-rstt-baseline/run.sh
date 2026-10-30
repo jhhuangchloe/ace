@@ -3,10 +3,10 @@
 #
 #   bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh                    # 1. pretrain
 #   STAGE=finetune bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh     # 2. fine-tune
-#   STAGE=scratch GPUS=3,4 bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh  # control
+#   STAGE=scratch GPUS=1,3 bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh  # control
 #
-# Knobs: STAGE (pretrain|finetune|scratch), GPUS="1,3" (comma list; configs use global batch_size
-# 16, so 1, 2, 4, 8 or 16 GPUs), ENV_NAME=fme, CONFIG=<path> to override the config.
+# Knobs: STAGE (pretrain|finetune|scratch), GPUS="0,2" (comma list; configs use global batch_size
+# 32, so 1, 2, 4, 8, 16 or 32 GPUs; 16 per GPU needs ~34 GB), ENV_NAME=fme, CONFIG=<path> to override the config.
 # The data must already be local: ../2026-10-10-video-pmd-two-block-vortex-shift/prepare_data.py.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ set -euo pipefail
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 
 STAGE="${STAGE:-pretrain}"
-GPUS="${GPUS:-1,3}"
+GPUS="${GPUS:-0,2}"
 ENV_NAME="${ENV_NAME:-fme}"
 DATA_DIR="/data/pmd/local_data"
 

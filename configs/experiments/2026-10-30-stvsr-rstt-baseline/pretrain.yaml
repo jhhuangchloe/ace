@@ -13,7 +13,8 @@
 # Data, split and patch size: as ../2026-10-15-video-pmd-two-block-v3-baseline/video_train.yaml.
 # Launch: bash run.sh (STAGE=pretrain is the default).
 experiment_dir: /data/pmd/runs/stvsr-rstt-pretrain
-# RSTT-S at batch 8/GPU: ~0.6 s/step, ~17 GB peak on one L40S (forward+backward on random data).
+# RSTT-S on one L40S (forward+backward, random data): ~0.07 s/sample at batch 4-8 (no faster per sample
+# at larger batch), ~2.1 GB/sample peak (17 GB at batch 8), so ~34 GB at the 16/GPU used here.
 # The paper's own ablation (Table 3c): 50 pretraining epochs are nearly as good as 200.
 max_epochs: 10
 validate_using_ema: true
@@ -59,7 +60,7 @@ train_data:
       subset:
         start_time: "2013-01-02"
         stop_time: "2021-12-31"
-  batch_size: 16  # global across ranks: 2 GPUs x 8
+  batch_size: 32  # global across ranks: 2 GPUs x 16 (~34 GB/GPU est.; per-sample speed is flat beyond ~4)
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -84,7 +85,7 @@ validation_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 16
+  batch_size: 32
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
@@ -109,7 +110,7 @@ test_data:
       subset:
         start_time: "2022-06-01"
         stop_time: "2022-09-30"
-  batch_size: 16
+  batch_size: 32
   num_data_workers: 4
   strict_ensemble: false
   lat_extent:
