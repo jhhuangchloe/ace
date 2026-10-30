@@ -1,0 +1,158 @@
+# Deterministic space-time SR baseline, stage 1: RSTT-S (Geng et al., CVPR 2022) pretrained on the
+# pseudo-temporal pretext task of Choi et al., "Time Without Time" (CVPR 2026).
+# Same I/O as the two-block diffusion runs: two 100 km endpoint frames in, all nine 25 km frames
+# (3-hourly over 24 h) out. Model and recipe: fme/downscaling/stvsr.py, pseudo_temporal.py,
+# modules/rstt.py.
+#
+# Pretext sample (one per clip): a random time step's 100 km frame is copied into both endpoint
+# inputs, with an independent random 50% of 4x4-coarse-pixel blocks zero-filled (= climatological
+# mean) in each; the target is that time step's 25 km frame at all nine output frames; squared
+# error weighted 1 / (1 + number of inputs showing the block). Validation/best-checkpoint metric is
+# still generation on REAL clips. Stage 2 (finetune.yaml) starts from this run's latest.ckpt.
+#
+# Data, split and patch size: as ../2026-10-15-video-pmd-two-block-v3-baseline/video_train.yaml.
+# Launch: bash run.sh (STAGE=pretrain is the default).
+experiment_dir: /data/pmd/runs/stvsr-rstt-pretrain
+# RSTT-S at batch 8/GPU: ~0.6 s/step, ~17 GB peak on one L40S (forward+backward on random data).
+# The paper's own ablation (Table 3c): 50 pretraining epochs are nearly as good as 200.
+max_epochs: 10
+validate_using_ema: true
+validate_interval: 1
+test_interval: 5
+max_val_batches: 40
+max_test_batches: 40
+generate_n_samples: 1
+logging:
+  log_to_screen: true
+  log_to_wandb: false
+  log_to_file: true
+  project: ace-temporal-interp
+  name: local-stvsr-rstt-pretrain
+  entity: ai2cm
+# RSTT reference: Adam(lr 2e-4, betas 0.9/0.99), cosine annealing to 1e-7.
+optimization:
+  optimizer_type: Adam
+  lr: 0.0002
+  kwargs:
+    betas: [0.9, 0.99]
+  scheduler:
+    type: CosineAnnealingLR
+    kwargs:
+      eta_min: 1.0e-7
+ema:
+  decay: 0.999
+coarse_patch_extent_lat: 44
+coarse_patch_extent_lon: 72
+train_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2021-12-31"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2013-01-02"
+        stop_time: "2021-12-31"
+  batch_size: 16  # global across ranks: 2 GPUs x 8
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+validation_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 16
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+test_data:
+  n_timesteps: 9
+  fine:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  coarse:
+    - data_path: /data/pmd/local_data
+      file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+      engine: zarr
+      subset:
+        start_time: "2022-06-01"
+        stop_time: "2022-09-30"
+  batch_size: 16
+  num_data_workers: 4
+  strict_ensemble: false
+  lat_extent:
+    start: -88
+    stop: 88
+  lon_extent:
+    start: 0
+    stop: 360
+model:
+  rstt:  # RSTT-S, the reference's configs/RSTT-S.yml (these are also the defaults)
+    embed_dim: 96
+    depths: [4, 4, 4, 4, 4, 4, 4, 4]
+    num_heads: [2, 4, 8, 16, 16, 8, 4, 2]
+    window_size: [4, 4]
+    mlp_ratio: 2.0
+    drop_path_rate: 0.1
+    back_rbs: 0
+  pseudo_temporal_pretraining:  # the paper's defaults
+    block_size: 4
+    mask_ratio: 0.5
+  n_timesteps: 9
+  upscale: 4
+  log_transform_channels:
+    PRATEsfc: 86400.0  # precip modeled in log1p(mm/day) space, as in the diffusion runs
+  out_names:
+    - eastward_wind_at_ten_meters
+    - northward_wind_at_ten_meters
+    - PRMSL
+    - PRATEsfc
+    - air_temperature_at_two_meters
+  # Fine (25 km) statistics, as in the diffusion runs; applied to the 100 km inputs too, so inputs,
+  # baseline and output share physical units (the bicubic-upsampled 100 km endpoints are the
+  # baseline, as in the diffusion runs, whatever the normalization).
+  normalization:
+    means:
+      eastward_wind_at_ten_meters: -0.036200
+      northward_wind_at_ten_meters: 0.170470
+      PRMSL: 1008.160699
+      PRATEsfc: 0.484074   # log1p(PRATEsfc * 86400) space, matching log_transform_channels
+      air_temperature_at_two_meters: 279.675977
+    stds:
+      eastward_wind_at_ten_meters: 5.627319
+      northward_wind_at_ten_meters: 4.692752
+      PRMSL: 15.043594
+      PRATEsfc: 0.850964
+      air_temperature_at_two_meters: 20.455977
