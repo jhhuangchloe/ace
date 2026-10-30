@@ -29,6 +29,7 @@ from fme.downscaling.data import (
     PairedVideoGriddedData,
     RegionSamplingConfig,
 )
+from fme.downscaling.stvsr import STVSRModelConfig, parse_video_model_config
 from fme.downscaling.video_models import (
     VideoDiffusionModelConfig,
     _linear_interp_endpoints,
@@ -129,6 +130,30 @@ def restore_checkpoint(trainer: "VideoTrainer") -> None:
     trainer.ema = EMATracker.from_state(checkpoint["ema"], trainer.model.modules)
 
 
+def init_weights_from_checkpoint(trainer: "VideoTrainer", path: str) -> None:
+    """Initialize the model weights from another run's checkpoint (its EMA
+    weights when it has them, as used for that run's validation), e.g. to
+    fine-tune a pretrained model. Optimizer state, epoch counters and the best
+    validation metric start fresh, and the EMA restarts from the loaded weights.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # Strip any DDP "module." prefix and load into the bare network, so the
+    # source run may have used a different number of GPUs (same as
+    # video_inference.load_video_model).
+    state_dict = {
+        (key[len("module.") :] if key.startswith("module.") else key): value
+        for key, value in checkpoint["module"].items()
+    }
+    getattr(trainer.model.module, "module", trainer.model.module).load_state_dict(
+        state_dict
+    )
+    if "ema" in checkpoint:
+        EMATracker.from_state(checkpoint["ema"], trainer.model.modules).copy_to(
+            trainer.model.modules
+        )
+    trainer.ema = trainer.config.ema.build(trainer.model.modules)
+
+
 @dataclasses.dataclass
 class VideoTrainerConfig:
     """Configuration for the video diffusion Trainer.
@@ -150,9 +175,14 @@ class VideoTrainerConfig:
             falls within a specified lat/lon region during training only
             (validation/test patches are unchanged so metrics stay
             comparable). Requires both patch extents to be set.
+        init_weights_from: Optional checkpoint whose model weights (EMA when
+            present) initialize a new run, e.g. fine-tuning from a pretrained
+            run -- see ``init_weights_from_checkpoint``. Ignored when resuming
+            this run's own checkpoint.
     """
 
-    model: VideoDiffusionModelConfig
+    # Diffusion model, or the deterministic RSTT baseline (fme/downscaling/stvsr.py).
+    model: VideoDiffusionModelConfig | STVSRModelConfig
     optimization: OptimizationConfig
     train_data: PairedDataLoaderConfig
     validation_data: PairedDataLoaderConfig
@@ -179,6 +209,7 @@ class VideoTrainerConfig:
     coarse_patch_extent_lat: int | None = None
     coarse_patch_extent_lon: int | None = None
     region_sampling: RegionSamplingConfig | None = None
+    init_weights_from: str | None = None
 
     def __post_init__(self):
         datasets = [
@@ -634,6 +665,7 @@ def main(config_path: str):
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    parse_video_model_config(config["model"])  # surfaces model validation errors
     train_config: VideoTrainerConfig = dacite.from_dict(
         data_class=VideoTrainerConfig,
         data=config,
@@ -652,6 +684,9 @@ def main(config_path: str):
     if trainer.resuming:
         logging.info(f"Resuming training from {trainer.epoch_checkpoint_path}")
         restore_checkpoint(trainer)
+    elif train_config.init_weights_from is not None:
+        logging.info(f"Initializing weights from {train_config.init_weights_from}")
+        init_weights_from_checkpoint(trainer, train_config.init_weights_from)
     logging.info(f"Number of parameters: {count_parameters(trainer.model.modules)}")
     trainer.train()
 

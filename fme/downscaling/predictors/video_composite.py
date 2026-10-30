@@ -5,6 +5,7 @@ from fme.downscaling.data.datasets import PairedVideoBatchData, VideoBatchData
 from fme.downscaling.data.patching import Patch, get_patches
 from fme.downscaling.data.utils import scale_tuple
 from fme.downscaling.predictors.composite import composite_patch_predictions
+from fme.downscaling.stvsr import STVSRModel
 from fme.downscaling.video_models import VideoDiffusionModel
 
 
@@ -37,7 +38,7 @@ class VideoPatchPredictor:
 
     def __init__(
         self,
-        model: VideoDiffusionModel,
+        model: VideoDiffusionModel | STVSRModel,
         coarse_yx_patch_extent: tuple[int, int],
         downscale_factor: int,
         coarse_horizontal_overlap: int = 1,

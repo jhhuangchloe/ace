@@ -38,6 +38,7 @@ from fme.core.writer import ZarrWriter
 from fme.downscaling.data import PairedDataLoaderConfig
 from fme.downscaling.inference.zarr_utils import determine_zarr_chunks
 from fme.downscaling.predictors.video_composite import VideoPatchPredictor
+from fme.downscaling.stvsr import STVSRModel, STVSRModelConfig, parse_video_model_config
 from fme.downscaling.video_models import VideoDiffusionModel, VideoDiffusionModelConfig
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,11 @@ DIMS = (TIME_NAME, ENSEMBLE_NAME, LAT_NAME, LON_NAME)
 
 
 def load_video_model(
-    model_config: VideoDiffusionModelConfig,
+    model_config: VideoDiffusionModelConfig | STVSRModelConfig,
     checkpoint_path: str,
     device: torch.device,
     use_ema: bool = True,
-) -> VideoDiffusionModel:
+) -> VideoDiffusionModel | STVSRModel:
     """Build the model from config and load trained weights.
 
     The training config used ``validate_using_ema: true``, so the checkpoint
@@ -147,7 +148,7 @@ class VideoInferenceConfig:
     """
 
     checkpoint_path: str
-    model: VideoDiffusionModelConfig
+    model: VideoDiffusionModelConfig | STVSRModelConfig
     data: PairedDataLoaderConfig
     output_path: str
     experiment_dir: str
@@ -237,7 +238,7 @@ def run_inference(config: VideoInferenceConfig) -> None:
         train=False, requirements=config.model.data_requirements
     )
 
-    predictor: VideoDiffusionModel | VideoPatchPredictor
+    predictor: VideoDiffusionModel | STVSRModel | VideoPatchPredictor
     if config.divide_generation:
         assert config.coarse_patch_extent is not None  # validated in __post_init__
         lat_extent, lon_extent = config.coarse_patch_extent
@@ -435,6 +436,7 @@ def main(config_path: str) -> None:
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    parse_video_model_config(config["model"])  # surfaces model validation errors
     inference_config: VideoInferenceConfig = dacite.from_dict(
         data_class=VideoInferenceConfig,
         data=config,
