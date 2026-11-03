@@ -6,7 +6,7 @@
 #   STAGE=scratch GPUS=1,3 bash configs/experiments/2026-10-30-stvsr-rstt-baseline/run.sh  # control
 #
 # Knobs: STAGE (pretrain|finetune|scratch), GPUS="0,2" (comma list; configs use global batch_size
-# 48, so 1, 2, 3, 4, 6, 8, ... GPUs; 24 per GPU needs ~51 GB), ENV_NAME=fme, CONFIG=<path> to override
+# 64, so 1, 2, 4, 8, ... GPUs; 32 per GPU needs ~68 GB), ENV_NAME=fme, CONFIG=<path> to override
 # the config.
 # The data must already be local: ../2026-10-10-video-pmd-two-block-vortex-shift/prepare_data.py.
 set -euo pipefail
@@ -46,6 +46,23 @@ EXPERIMENT_DIR=$(awk '/^experiment_dir:/ {print $2}' "$CONFIG")
 if [ -n "$INIT" ] && [ ! -f "$INIT" ] && [ ! -f "$EXPERIMENT_DIR/checkpoints/latest.ckpt" ]; then
     echo "init_weights_from $INIT does not exist -- run the pretraining stage first." >&2
     exit 1
+fi
+
+# After a driver upgrade without a reboot, NVML (used by nvidia-smi and NCCL) fails with
+# "Driver/library version mismatch". If the libnvidia-ml matching the loaded kernel module is still
+# installed, put it first on LD_LIBRARY_PATH.
+if ! nvidia-smi >/dev/null 2>&1; then
+    KMOD_VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version | head -1)
+    NVML_LIB="/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.$KMOD_VERSION"
+    if [ ! -f "$NVML_LIB" ]; then
+        echo "nvidia-smi fails and $NVML_LIB is missing; reboot to load the new driver." >&2
+        exit 1
+    fi
+    NVML_SHIM_DIR=$(mktemp -d)
+    trap 'rm -rf "$NVML_SHIM_DIR"' EXIT
+    ln -s "$NVML_LIB" "$NVML_SHIM_DIR/libnvidia-ml.so.1"
+    export LD_LIBRARY_PATH="$NVML_SHIM_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "Using $NVML_LIB to match kernel module $KMOD_VERSION (reboot to clear the mismatch)."
 fi
 
 # Refuse to start on a GPU that something else is already using.
