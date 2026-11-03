@@ -10,6 +10,7 @@
 # Control (same data/steps, linear baseline) -- run after, or on other GPUs:
 #   VARIANT=control bash configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/run.sh
 #   VARIANT=control GPUS=3,5 bash .../run.sh
+# Bicubic spatial base (two_block_spatial_upsample: bicubic): VARIANT=vortex-bicubic / control-bicubic.
 # Other knobs: GPUS="2,3,4,6,7" (comma list; the configs use global batch_size 5, so
 # use 1 or 5 GPUs, or edit batch_size; NCCL_SHM_DISABLE=1 helped when GPUs span
 # both CPU sockets), ENV_NAME=fme, CONFIG=<path> to override the config.
@@ -28,7 +29,9 @@ REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 case "$VARIANT" in
     vortex) DEFAULT_CONFIG="$SCRIPT_DIR/video_train.yaml" ;;
     control) DEFAULT_CONFIG="$SCRIPT_DIR/video_train_control.yaml" ;;
-    *) echo "VARIANT must be 'vortex' or 'control', got '$VARIANT'" >&2; exit 1 ;;
+    vortex-bicubic) DEFAULT_CONFIG="$SCRIPT_DIR/video_train_bicubic.yaml" ;;
+    control-bicubic) DEFAULT_CONFIG="$SCRIPT_DIR/video_train_control_bicubic.yaml" ;;
+    *) echo "VARIANT must be 'vortex', 'control', 'vortex-bicubic' or 'control-bicubic', got '$VARIANT'" >&2; exit 1 ;;
 esac
 CONFIG="${CONFIG:-$DEFAULT_CONFIG}"
 N_GPUS=$(awk -F, '{print NF}' <<<"$GPUS")
