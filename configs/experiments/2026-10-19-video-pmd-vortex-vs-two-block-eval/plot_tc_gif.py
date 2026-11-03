@@ -40,7 +40,7 @@ V3_LABELS = {"baseline": V3_BASE, "raw": V3_RAW}
 V3_COLORS = {V3_BASE: "#9467bd", V3_RAW: "#8c564b"}
 V3_SHOW = [V3_LABELS[k] for k in os.environ.get("V3_SERIES", "baseline raw").split()]
 V3_MAP_SHOW = [V3_LABELS[k] for k in os.environ.get("V3_MAPS", "baseline").split()]
-MODEL_COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e"}
+MODEL_COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e", "v3-residual": "#ff7f0e"}
 COLORS = {"25 km truth": "black", **{m: MODEL_COLORS[m] for m in MODELS}, LINEAR: "#1f77b4"}
 COLORS.update({n: V3_COLORS[n] for n in V3_MAP_SHOW})
 SERIES_COLORS = {n: c for n, c in COLORS.items() if n not in V3_COLORS}

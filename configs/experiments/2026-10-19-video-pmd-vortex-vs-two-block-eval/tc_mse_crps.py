@@ -32,6 +32,8 @@ def hpa(a):
 def fair_crps(ens, y):
     """ens (E, ...), y (...) -> CRPS per element (Ferro 2008, sorted-order-statistics identity)."""
     m = ens.shape[0]
+    if m == 1:  # deterministic: CRPS reduces to the absolute error
+        return np.abs(ens[0] - y)
     s = np.sort(ens, axis=0)
     w = (2 * np.arange(1, m + 1) - m - 1).reshape((m,) + (1,) * y.ndim)
     return np.abs(ens - y).mean(0) - (w * s).sum(0) / (m * (m - 1))
