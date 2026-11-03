@@ -91,6 +91,7 @@ from fme.downscaling.twoblock import (
     conservative_downsample,
     d_target,
     null_space_projector,
+    smooth_upsample,
 )
 from fme.downscaling.v3_baseline import (
     V3Baseline,
@@ -507,6 +508,16 @@ class VideoDiffusionModelConfig:
     # (conditional_kernel.project_onto_kernel_hull) -- kept out of the DSM
     # graph via detach(), not a second optimizer.
     two_block_conditional_kernel: bool = False
+    # Spatial upsampling used to carry the coarse baseline to the fine grid: "block"
+    # (piecewise-constant U, the original two-block choice) or "bicubic" (the smooth
+    # mean-preserving S of twoblock.smooth_upsample: bicubic plus a block-constant
+    # correction, D S = I). HiRO-ACE builds on a bicubic base; with "bicubic" the
+    # baseline is bicubic in space and linear (or vortex-shifted / V3) in time. The
+    # coarse recovery guarantee D(x_hat) = I + r_hat is unchanged; d becomes
+    # x_f - S D x_f (the fine detail beyond the smooth base), so d_sigma_data must be
+    # re-estimated (scripts/v3_baseline/r_statistics.py). Applies to the coarse
+    # conditioning, the baseline conditioning, d and the assembly.
+    two_block_spatial_upsample: str = "block"
     # Translation-aware two-block baseline (fme/downscaling/vortex_shift.py).
     # Linear temporal interpolation of the coarse endpoints cross-fades a
     # moving vortex instead of translating it, so r = x_c - I has to carry the
@@ -891,6 +902,15 @@ class VideoDiffusionModelConfig:
                     "condition_encoder_hidden must be >= 1, got "
                     f"{self.condition_encoder_hidden}."
                 )
+        if self.two_block_spatial_upsample not in ("block", "bicubic"):
+            raise ValueError(
+                "two_block_spatial_upsample must be 'block' or 'bicubic', got "
+                f"{self.two_block_spatial_upsample!r}."
+            )
+        if self.two_block_spatial_upsample == "bicubic" and not self.two_block:
+            raise ValueError(
+                "two_block_spatial_upsample='bicubic' requires two_block=True."
+            )
         if self.v3_detail_baseline and self.v3_baseline_checkpoint is None:
             raise ValueError("v3_detail_baseline requires v3_baseline_checkpoint.")
         if self.coarse_block_in_fine_units and not self.two_block:
@@ -1960,6 +1980,20 @@ class VideoDiffusionModel:
             search_cells=self.config.vortex_search_cells,
         )
 
+    def _spatial_upsample(self, x: torch.Tensor, factor: int) -> torch.Tensor:
+        """``U`` (block) or the smooth mean-preserving ``S`` (bicubic): carries a coarse
+        field to the fine grid for the baseline and the coarse part of the output.
+        """
+        if self.config.two_block_spatial_upsample == "bicubic":
+            return smooth_upsample(x, factor)
+        return block_replicate_upsample(x, factor)
+
+    def _fine_detail(self, x: torch.Tensor, factor: int) -> torch.Tensor:
+        """The part of a fine field beyond the coarse baseline's spatial base,
+        ``x - S(D(x))`` (``Pi(x)`` for block upsampling); it has no coarse average.
+        """
+        return x - self._spatial_upsample(conservative_downsample(x, factor), factor)
+
     def _two_block_baselines(
         self, coarse_clip: torch.Tensor, factor: int
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -2022,7 +2056,7 @@ class VideoDiffusionModel:
         # configured); express it in the model's normalized fine units and keep
         # only its fine-scale part
         fine_norm = self.normalizer.normalize({n: fine_raw[n] for n in self.out_names})
-        detail = null_space_projector(
+        detail = self._fine_detail(
             self.packer.pack(fine_norm, axis=CHANNEL_AXIS), factor
         )
         return interp, detail
@@ -2041,7 +2075,7 @@ class VideoDiffusionModel:
             self.config.vortex_shift_baseline
             or self.config.v3_baseline_checkpoint is not None
         ):
-            baseline = block_replicate_upsample(interp, factor)
+            baseline = self._spatial_upsample(interp, factor)
             if detail is not None:
                 baseline = baseline + detail  # the full 25 km baseline
             condition = torch.cat([condition, baseline], dim=CHANNEL_AXIS)
@@ -2068,7 +2102,10 @@ class VideoDiffusionModel:
 
         interp, detail = self._two_block_baselines(coarse_clip, factor)
         r = coarse_clip - interp
-        d = d_target(fine_clip, coarse_clip, factor)
+        if self.config.two_block_spatial_upsample == "bicubic":
+            d = self._fine_detail(fine_clip, factor)
+        else:
+            d = d_target(fine_clip, coarse_clip, factor)
         if detail is not None:
             d = d - detail  # d is the residual against V3's own fine-scale prediction
         r_fine = block_replicate_upsample(r, factor)
@@ -2084,7 +2121,7 @@ class VideoDiffusionModel:
             dim=CHANNEL_AXIS,
         )
 
-        coarse_upsampled = block_replicate_upsample(coarse_clip, factor)
+        coarse_upsampled = self._spatial_upsample(coarse_clip, factor)
         # _conditioning's fine-endpoint block is a no-op here (endpoints_observed
         # is False, validated in __post_init__) -- only coarse_upsampled matters,
         # masked to the endpoint positions via coarse_endpoints_only.
@@ -2130,7 +2167,13 @@ class VideoDiffusionModel:
             d_hat = denoised_d * d_mask
             if detail is not None:
                 d_hat = d_hat + detail
-            full_norm = assemble_fine_output(interp, r_hat, d_hat, factor)
+            full_norm = assemble_fine_output(
+                interp,
+                r_hat,
+                d_hat,
+                factor,
+                smooth=self.config.two_block_spatial_upsample == "bicubic",
+            )
             prediction = self._denormalize_invert(full_norm)
 
             weighted_sq_err = sq_err * weight
@@ -2360,7 +2403,7 @@ class VideoDiffusionModel:
             dim=CHANNEL_AXIS,
         )
         coarse_h, coarse_w = coarse_clip.shape[-2:]
-        coarse_upsampled = block_replicate_upsample(coarse_clip, factor)
+        coarse_upsampled = self._spatial_upsample(coarse_clip, factor)
         condition = self._two_block_condition(
             fine_clip, r_mask, coarse_upsampled, interp, factor, detail
         )
@@ -2462,7 +2505,13 @@ class VideoDiffusionModel:
             # assemble_fine_output only uses interp + r_hat, so fold the conversion
             # of their sum into interp
             interp = self._coarse_to_fine_normalized(interp + r_hat) - r_hat
-        full_norm = assemble_fine_output(interp, r_hat, denoised_d, factor)
+        full_norm = assemble_fine_output(
+            interp,
+            r_hat,
+            denoised_d,
+            factor,
+            smooth=self.config.two_block_spatial_upsample == "bicubic",
+        )
         generated = self._denormalize_invert(full_norm)
         return {
             k: v.reshape(batch_size, n_samples, *v.shape[1:])

@@ -75,6 +75,37 @@ def block_replicate_upsample(x: torch.Tensor, factor: int) -> torch.Tensor:
     return x.repeat_interleave(factor, dim=-2).repeat_interleave(factor, dim=-1)
 
 
+def smooth_upsample(x: torch.Tensor, factor: int) -> torch.Tensor:
+    """``S``: a smooth (bicubic) upsample by ``factor`` that keeps the exact
+    left-inverse property ``D @ S = I`` of ``block_replicate_upsample``.
+
+    Plain bicubic interpolation is smooth but does not preserve block means, so a
+    block-constant correction ``U(x - D(bicubic(x)))`` is added: the result is bicubic
+    in the interior of every coarse cell pattern and averages back to ``x`` exactly
+    (``D(S(x)) == x`` to float precision). The bicubic part is cell-centre aligned
+    (fine cells nest in coarse cells) with replicated edges.
+
+    Using ``S`` in place of ``U`` keeps every two-block guarantee: the fine detail then
+    lives in ``null(D)`` as ``x - S(D(x))`` (the oblique projector ``I - S D``, still
+    idempotent with ``D(I - S D) = 0``), and ``D(S(I + r) + d) = I + r`` for any
+    ``d`` in ``null(D)``. This is the same smooth spatial base HiRO-ACE builds on
+    (``metrics_and_maths.interpolate``), made mean-preserving.
+
+    Args:
+        x: Any tensor whose last two dims are the coarse spatial dims.
+        factor: The upscale factor.
+    """
+    *lead, height, width = x.shape
+    bicubic = torch.nn.functional.interpolate(
+        x.reshape(-1, 1, height, width),
+        scale_factor=factor,
+        mode="bicubic",
+        align_corners=False,
+    ).reshape(*lead, height * factor, width * factor)
+    correction = x - conservative_downsample(bicubic, factor)
+    return bicubic + block_replicate_upsample(correction, factor)
+
+
 def null_space_projector(x: torch.Tensor, factor: int) -> torch.Tensor:
     """``Pi(x) = x - U(D(x))``: projects ``x`` onto ``null(D)``, removing the
     coarse-block-mean component and leaving only the fine detail beyond what
@@ -172,9 +203,12 @@ def assemble_fine_output(
     r_hat: torch.Tensor,
     d_hat: torch.Tensor,
     factor: int,
+    smooth: bool = False,
 ) -> torch.Tensor:
     """``x_hat_f(tau) = U(I(tau) + r_hat(tau)) + Pi(d_hat(tau))``: the
-    fine-resolution output assembled from the two blocks' predictions.
+    fine-resolution output assembled from the two blocks' predictions. With
+    ``smooth`` the coarse part uses ``S`` (``smooth_upsample``) instead of ``U``; the
+    exact-recovery guarantee is the same since ``D S = I``.
 
     ``d_hat`` is re-projected through ``null_space_projector`` here (rather
     than trusted to already lie in ``null(D)``) so that the exact-recovery
@@ -192,10 +226,11 @@ def assemble_fine_output(
         r_hat: Predicted coarse-temporal residual, same shape as ``interp``.
         d_hat: Predicted fine-detail residual, ``(B, C, T, Hf, Wf)``.
         factor: Coarse-to-fine downscale factor.
+        smooth: Use ``smooth_upsample`` instead of block replication for the
+            coarse part.
 
     Returns:
         Fine-resolution assembled output, ``(B, C, T, Hf, Wf)``.
     """
-    return block_replicate_upsample(interp + r_hat, factor) + null_space_projector(
-        d_hat, factor
-    )
+    upsample = smooth_upsample if smooth else block_replicate_upsample
+    return upsample(interp + r_hat, factor) + null_space_projector(d_hat, factor)

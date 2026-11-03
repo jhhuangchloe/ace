@@ -9,6 +9,7 @@ from fme.downscaling.twoblock import (
     d_target,
     null_space_projector,
     r_target,
+    smooth_upsample,
 )
 
 
@@ -186,3 +187,53 @@ def test_assemble_fine_output_reconstructs_truth_from_true_targets():
     d = d_target(fine_clip, coarse_clip, factor)
     reconstructed = assemble_fine_output(interp, r, d, factor)
     assert torch.allclose(reconstructed, fine_clip, atol=1e-6)
+
+
+def test_smooth_upsample_is_an_exact_left_inverse_of_downsample():
+    x = torch.randn(2, 3, 9, 6, 10, dtype=torch.float64)
+    up = smooth_upsample(x, 4)
+    assert up.shape == (2, 3, 9, 24, 40)
+    torch.testing.assert_close(conservative_downsample(up, 4), x, atol=1e-12, rtol=0)
+
+
+def test_smooth_upsample_reproduces_constants_and_ramps_and_is_smoother_than_blocks():
+    assert torch.allclose(
+        smooth_upsample(torch.full((1, 8, 8), 3.0), 4), torch.tensor(3.0)
+    )
+    # a linear ramp, away from the replicated edges (torch's cubic kernel, a = -0.75,
+    # is not exact for ramps: error well under 5% of one coarse step)
+    ramp = torch.arange(10, dtype=torch.float64)[None, :].expand(10, 10)[None]
+    fine_x = (torch.arange(40, dtype=torch.float64) + 0.5) / 4 - 0.5
+    expected = fine_x[None, :].expand(40, 40)[None]
+    err = (smooth_upsample(ramp, 4) - expected)[..., 8:-8, 8:-8].abs().max()
+    assert err < 0.05
+    # on a smooth field it is closer to the truth than block replication
+    yy, xx = torch.meshgrid(torch.arange(32.0), torch.arange(32.0), indexing="ij")
+    truth_fine = torch.sin(yy / 12.0) * torch.cos(xx / 9.0)
+    coarse = conservative_downsample(truth_fine, 4)
+    assert (smooth_upsample(coarse, 4) - truth_fine).pow(2).mean() < 0.2 * (
+        block_replicate_upsample(coarse, 4) - truth_fine
+    ).pow(2).mean()
+
+
+def test_smooth_detail_projector_is_idempotent_and_has_no_coarse_average():
+    x = torch.randn(2, 2, 3, 16, 16, dtype=torch.float64)
+    detail = x - smooth_upsample(conservative_downsample(x, 4), 4)
+    torch.testing.assert_close(
+        conservative_downsample(detail, 4),
+        torch.zeros(2, 2, 3, 4, 4, dtype=torch.float64),
+        atol=1e-12,
+        rtol=0,
+    )
+    again = detail - smooth_upsample(conservative_downsample(detail, 4), 4)
+    torch.testing.assert_close(again, detail, atol=1e-12, rtol=0)
+
+
+def test_assemble_fine_output_smooth_keeps_exact_coarse_recovery():
+    interp = torch.randn(2, 2, 5, 4, 6, dtype=torch.float64)
+    r_hat = torch.randn_like(interp)
+    d_hat = torch.randn(2, 2, 5, 16, 24, dtype=torch.float64)
+    out = assemble_fine_output(interp, r_hat, d_hat, 4, smooth=True)
+    torch.testing.assert_close(
+        conservative_downsample(out, 4), interp + r_hat, atol=1e-12, rtol=0
+    )

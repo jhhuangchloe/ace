@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import yaml
 
-from fme.downscaling.twoblock import coarse_temporal_interp, null_space_projector
+from fme.downscaling.twoblock import coarse_temporal_interp
 from fme.downscaling.video_train import VideoTrainerConfig
 
 
@@ -54,11 +54,11 @@ def main(config_path: str, out_path: str, n_batches: int = 250) -> None:
             coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
             factor = batch.fine.data[names[0]].shape[-1] // coarse.shape[-1]
             baseline, detail = model._two_block_baselines(coarse, factor)
+            fine = model._pack_normalized(batch.fine.data)
+            d = model._fine_detail(fine, factor)
+            d_sq["d"].append(d.pow(2).mean(dim=(0, 2, 3, 4)).cpu())
             if detail is not None:
-                fine = model._pack_normalized(batch.fine.data)
-                d = null_space_projector(fine, factor)
-                for key, x in (("d", d), ("d_res", d - detail)):
-                    d_sq[key].append(x.pow(2).mean(dim=(0, 2, 3, 4)).cpu())
+                d_sq["d_res"].append((d - detail).pow(2).mean(dim=(0, 2, 3, 4)).cpu())
             for key, interp in (
                 ("base", baseline),
                 ("lin", coarse_temporal_interp(coarse)),
@@ -74,14 +74,16 @@ def main(config_path: str, out_path: str, n_batches: int = 250) -> None:
                 flat = x.reshape(x.shape[0], -1).double().numpy()
                 covariances[f"{split}|{key}|{name}"] = flat @ flat.T / flat.shape[1]
             print(f"{name:34}{rms['lin']:12.4f}{rms['base']:14.4f}")
-        if d_sq["d"]:
-            print(
-                "detail block d (fine-normalized RMS): plain vs. after V3 fine baseline"
-            )
-            for i, name in enumerate(names):
-                plain = float(torch.stack(d_sq["d"])[:, i].mean().sqrt())
+        print("detail block d (fine-normalized RMS), the new d_sigma_data_by_channel:")
+        for i, name in enumerate(names):
+            plain = float(torch.stack(d_sq["d"])[:, i].mean().sqrt())
+            line = f"    {name:34}{plain:9.4f}"
+            if d_sq["d_res"]:
                 res = float(torch.stack(d_sq["d_res"])[:, i].mean().sqrt())
-                print(f"    {name:34}{plain:9.4f}{res:9.4f}   ratio {res / plain:.2f}")
+                line += (
+                    f"  after V3 fine baseline {res:9.4f}  (ratio {res / plain:.2f})"
+                )
+            print(line)
     np.savez(out_path, **covariances)
     print(f"\nsaved covariances to {out_path}")
     print("r_sigma_data_by_channel (mean of train and held-out baseline RMS):")

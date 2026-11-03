@@ -23,7 +23,11 @@ from fme.downscaling.noise import (
     LogNormalNoiseDistribution,
     LogUniformNoiseDistribution,
 )
-from fme.downscaling.twoblock import coarse_temporal_interp, conservative_downsample
+from fme.downscaling.twoblock import (
+    coarse_temporal_interp,
+    conservative_downsample,
+    null_space_projector,
+)
 from fme.downscaling.v3_baseline import V3Baseline, V3Config
 from fme.downscaling.video_models import (
     CHANNEL_AXIS,
@@ -1978,3 +1982,76 @@ def test_v3_detail_baseline_train_and_exact_coarse_recovery(tmp_path):
         ref = interp_phys[name].unsqueeze(1).expand_as(down)
         assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
         assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
+def test_bicubic_spatial_upsample_config_validation():
+    with pytest.raises(ValueError, match="must be 'block' or 'bicubic'"):
+        _two_block_model(5, two_block_spatial_upsample="nearest")
+    with pytest.raises(ValueError, match="requires two_block"):
+        _coarse_endpoints_only_model(5, two_block_spatial_upsample="bicubic")
+
+
+def test_fine_detail_matches_the_null_space_projector_for_block_upsampling():
+    block = _two_block_model(5)
+    x = torch.randn(2, 2, 5, 8, 8)
+    assert torch.allclose(block._fine_detail(x, 2), null_space_projector(x, 2))
+
+
+def test_fine_detail_with_bicubic_upsampling_has_no_coarse_average_and_is_smaller():
+    bicubic = _two_block_model(5, two_block_spatial_upsample="bicubic")
+    # a smooth fine field: the bicubic base carries most of it, so less is "detail"
+    yy, xx = torch.meshgrid(torch.arange(16.0), torch.arange(16.0), indexing="ij")
+    smooth = (torch.sin(yy / 5.0) + torch.cos(xx / 4.0))[None, None, None].expand(
+        1, 2, 5, 16, 16
+    )
+    detail = bicubic._fine_detail(smooth, 2)
+    assert conservative_downsample(detail, 2).abs().max() < 1e-5
+    assert detail.pow(2).mean() < 0.25 * null_space_projector(smooth, 2).pow(2).mean()
+
+
+def test_bicubic_spatial_upsample_train_and_exact_coarse_recovery():
+    n_times, factor = 5, 2
+    model = _two_block_model(n_times, two_block_spatial_upsample="bicubic")
+    batch = _spatial_paired_batch(
+        batch_size=2,
+        n_times=n_times,
+        fine_height=8,
+        fine_width=8,
+        downscale_factor=factor,
+    )
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    assert all(
+        torch.isfinite(p.grad).all()
+        for p in model.module.parameters()
+        if p.grad is not None
+    )
+    generated = model.generate(batch, n_samples=2)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    for name in OUT_NAMES:
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
+def test_bicubic_spatial_upsample_changes_the_coarse_conditioning():
+    block = _two_block_model(5)
+    bicubic = _two_block_model(5, two_block_spatial_upsample="bicubic")
+    x = torch.randn(2, 2, 5, 4, 4)
+    assert not torch.allclose(
+        block._spatial_upsample(x, 2), bicubic._spatial_upsample(x, 2)
+    )
+    assert torch.allclose(
+        conservative_downsample(bicubic._spatial_upsample(x, 2), 2), x, atol=1e-5
+    )
+
+
+def test_v3_detail_baseline_with_bicubic_upsampling_has_no_coarse_average(tmp_path):
+    model = _v3_detail_model(tmp_path, two_block_spatial_upsample="bicubic")
+    batch = _v3_detail_batch()
+    coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    _, detail = model._two_block_baselines(coarse, 4)
+    assert conservative_downsample(detail, 4).abs().max() < 1e-5
