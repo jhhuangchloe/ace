@@ -1295,6 +1295,48 @@ def test_two_block_generate_runs_and_is_stochastic():
     assert not torch.allclose(out[:, 0, 0], out[:, 1, 0], atol=1e-4)
 
 
+@pytest.mark.parametrize("coarse_block_in_fine_units", [True, False])
+def test_two_block_generated_endpoints_match_coarse_input_in_physical_units(
+    coarse_block_in_fine_units,
+):
+    # The coarse block is pinned to the coarse input at the endpoint frames, so the
+    # generated endpoints, averaged to the coarse grid, should reproduce it in
+    # physical units even when coarse and fine normalizations differ -- which only
+    # holds when the coarse block is converted to fine units before denormalizing.
+    n_times, fine_height, fine_width, factor = 5, 8, 8, 2
+    model = _model(
+        n_times,
+        coarse_normalization=NormalizationConfig(
+            means={"var0": 2.0, "var1": -1.0}, stds={"var0": 3.0, "var1": 0.5}
+        ),
+        endpoints_observed=False,
+        coarse_endpoints_only=True,
+        two_block=True,
+        coarse_block_in_fine_units=coarse_block_in_fine_units,
+    )
+    batch = _spatial_paired_batch(
+        batch_size=2,
+        n_times=n_times,
+        fine_height=fine_height,
+        fine_width=fine_width,
+        downscale_factor=factor,
+    )
+
+    generated = model.generate(batch, n_samples=2)
+    for name in OUT_NAMES:
+        coarse_avg = conservative_downsample(
+            generated[name][:, :, [0, -1]].flatten(0, 1), factor
+        )
+        expected = batch.coarse.data[name][:, None, [0, -1]].expand(-1, 2, -1, -1, -1)
+        matches = torch.allclose(coarse_avg, expected.flatten(0, 1), atol=1e-4)
+        assert matches == coarse_block_in_fine_units
+
+
+def test_coarse_block_in_fine_units_requires_two_block():
+    with pytest.raises(ValueError, match="coarse_block_in_fine_units requires"):
+        _coarse_endpoints_only_model(5, coarse_block_in_fine_units=True)
+
+
 def test_two_block_generate_rejects_frame_subsetting():
     n_times, fine_height, fine_width, factor = 5, 8, 8, 2
     model = _two_block_model(n_times)

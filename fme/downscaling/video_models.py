@@ -545,6 +545,14 @@ class VideoDiffusionModelConfig:
     # U(I) + Pi(B) (same number of channels). d_sigma_data must be re-estimated (the
     # residual d is smaller): scripts/v3_baseline/r_statistics.py.
     v3_detail_baseline: bool = False
+    # Generation only (two_block): convert the coarse block I + r_hat from coarse- to
+    # fine-normalized units before assembling the output. Both I and r live in
+    # coarse_normalization units, but the assembled output is denormalized with
+    # normalization, so when the two differ the coarse-scale output is offset by
+    # (x - mean_c) * (std_f / std_c - 1) + (mean_f - mean_c) per channel, which d
+    # (zero coarse average) cannot correct (e.g. +0.58 K in T2m at 301 K). Off by
+    # default to reproduce how existing checkpoints were trained and evaluated.
+    coarse_block_in_fine_units: bool = False
     weight_fit_loss_weight: float = 1.0
     condition_encoder_hidden: int = 16
 
@@ -885,6 +893,8 @@ class VideoDiffusionModelConfig:
                 )
         if self.v3_detail_baseline and self.v3_baseline_checkpoint is None:
             raise ValueError("v3_detail_baseline requires v3_baseline_checkpoint.")
+        if self.coarse_block_in_fine_units and not self.two_block:
+            raise ValueError("coarse_block_in_fine_units requires two_block=True.")
         if self.v3_baseline_checkpoint is not None:
             if not self.two_block:
                 raise ValueError("v3_baseline_checkpoint requires two_block=True.")
@@ -1616,6 +1626,16 @@ class VideoDiffusionModel:
         }
         normalized = (normalizer or self.normalizer).normalize(selected)
         return self.packer.pack(normalized, axis=CHANNEL_AXIS)
+
+    def _coarse_to_fine_normalized(self, packed: torch.Tensor) -> torch.Tensor:
+        """Re-express a packed clip from coarse- to fine-normalized units (both in
+        the log1p space of any log-transformed channel).
+        """
+        assert self.coarse_normalizer is not None
+        physical = self.coarse_normalizer.denormalize(
+            self.packer.unpack(packed, axis=CHANNEL_AXIS)
+        )
+        return self.packer.pack(self.normalizer.normalize(physical), axis=CHANNEL_AXIS)
 
     def _denormalize_invert(self, packed: torch.Tensor) -> TensorDict:
         """Denormalize and invert any log1p transform back to physical units."""
@@ -2438,6 +2458,10 @@ class VideoDiffusionModel:
         r_hat = conservative_downsample(denoised_r_fine, factor)
         if detail is not None:
             denoised_d = denoised_d + detail
+        if self.config.coarse_block_in_fine_units:
+            # assemble_fine_output only uses interp + r_hat, so fold the conversion
+            # of their sum into interp
+            interp = self._coarse_to_fine_normalized(interp + r_hat) - r_hat
         full_norm = assemble_fine_output(interp, r_hat, denoised_d, factor)
         generated = self._denormalize_invert(full_norm)
         return {
