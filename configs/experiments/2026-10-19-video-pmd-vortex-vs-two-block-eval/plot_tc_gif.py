@@ -1,9 +1,12 @@
-"""Storm-following GIF: top row 25km truth | two-block | vortex | linear interp. of the 00Z 100 km
-endpoints, bottom row the min-SLP / max-wind time series (moving marker) | each of the three minus truth
-(ensemble member 0).
+"""Storm-following GIF: top row 25km truth | each model | linear interp. of the 00Z 100 km
+endpoints | V3 maps (V3_MAPS), bottom row the min-SLP / max-wind time series (moving marker) | each of
+those minus truth (ensemble member 0).
 
-Usage: plot_tc_gif.py ROOT STORM TRACKS_JSON TRUTH_ZARR OUT_GIF FIELD [MEMBER]
+Usage: [MODELS="two-block vortex v3-ou"] plot_tc_gif.py ROOT STORM TRACKS_JSON TRUTH_ZARR OUT_GIF FIELD [MEMBER]
   FIELD: prmsl (hPa) or wind (10 m wind speed, m/s)
+  MODELS: subdirectories of ROOT to show (default "two-block vortex")
+  V3_SERIES: which V3 curves the time series shows, any of "baseline raw" (default both)
+  V3_MAPS: which V3 fields get a map and error panel, any of "baseline raw" (default baseline)
 Each frame is a 12x12 deg window centred on the known track position; shared colour scales.
 """
 import io
@@ -28,13 +31,20 @@ from PIL import Image
 root, storm, tracks_json, truth_path, out_gif, field = sys.argv[1:7]
 member = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 HALF = 6.0
-MODELS = ["two-block", "vortex"]
+MODELS = os.environ.get("MODELS", "two-block vortex").split()
 LINEAR = "linear interp. (bicubic)"
 NEAREST = "linear interp. (nearest)"
 V3_BASE = "V3 baseline"
 V3_RAW = "V3 raw 25 km"
-COLORS = {"25 km truth": "black", "two-block": "#2ca02c", "vortex": "#d62728", LINEAR: "#1f77b4", V3_BASE: "#9467bd"}
-SERIES_COLORS = {**COLORS, NEAREST: "#9ecae1", V3_RAW: "#8c564b"}
+V3_LABELS = {"baseline": V3_BASE, "raw": V3_RAW}
+V3_COLORS = {V3_BASE: "#9467bd", V3_RAW: "#8c564b"}
+V3_SHOW = [V3_LABELS[k] for k in os.environ.get("V3_SERIES", "baseline raw").split()]
+V3_MAP_SHOW = [V3_LABELS[k] for k in os.environ.get("V3_MAPS", "baseline").split()]
+MODEL_COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e"}
+COLORS = {"25 km truth": "black", **{m: MODEL_COLORS[m] for m in MODELS}, LINEAR: "#1f77b4"}
+COLORS.update({n: V3_COLORS[n] for n in V3_MAP_SHOW})
+SERIES_COLORS = {n: c for n, c in COLORS.items() if n not in V3_COLORS}
+SERIES_COLORS.update({NEAREST: "#9ecae1", **{n: V3_COLORS[n] for n in V3_SHOW}})
 CFG = {
     "prmsl": dict(cmap="turbo_r", vmin=920, vmax=1010, dmax=30, label="PRMSL (hPa)", ts="min SLP in window (hPa)"),
     "wind": dict(cmap="viridis", vmin=0, vmax=70, dmax=25, label="10 m wind speed (m/s)", ts="max wind in window (m/s)"),
@@ -111,7 +121,7 @@ x = np.arange(len(data))
 
 frames = []
 for i, (t_str, fr) in enumerate(data):
-    fig, axes = plt.subplots(2, 5, figsize=(25, 9), constrained_layout=True)
+    fig, axes = plt.subplots(2, len(COLORS), figsize=(5 * len(COLORS), 9), constrained_layout=True)
     for ax, name in zip(axes[0], COLORS):
         v, lat, lon = fr[name]
         im = ax.imshow(v, origin="lower", cmap=CFG["cmap"], vmin=CFG["vmin"], vmax=CFG["vmax"],
@@ -130,7 +140,7 @@ for i, (t_str, fr) in enumerate(data):
         ax.invert_yaxis()
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
-    for ax, name in zip(axes[1][1:], MODELS + [LINEAR, V3_BASE]):
+    for ax, name in zip(axes[1][1:], [n for n in COLORS if n != "25 km truth"]):
         diff = fr[name][0] - fr["25 km truth"][0]
         im2 = ax.imshow(diff, origin="lower", cmap="RdBu_r" if field == "wind" else "RdBu",
                         vmin=-CFG["dmax"], vmax=CFG["dmax"], extent=[lon[0], lon[-1], lat[0], lat[-1]], aspect="equal")

@@ -2,7 +2,7 @@
 
 (1) scalar: min SLP in the 5x5 deg window (one value per frame/member; truth = 25km min SLP)
 (2) field: every grid cell in a 10x10 deg box centred on the known track position
-    (PRMSL hPa; 10 m wind speed/u/v m/s; precip mm/day; T2m K); MSE of the ensemble mean + fair CRPS, area-weighted.
+    (PRMSL hPa; 10 m wind speed/u/v m/s; precip log1p(mm/day); T2m K); MSE of the ensemble mean + fair CRPS, area-weighted.
 Reported on intense frames (truth min SLP < 990 hPa) and on all frames.
 
 Usage: tc_mse_crps.py ROOT STORM TRACKS_JSON TRUTH_ZARR MODEL [MODEL ...]   (first = model under test)
@@ -64,7 +64,8 @@ for t_str, la, lo in track:
             ("wind10m", lambda d: np.hypot(d["eastward_wind_at_ten_meters"].values, d["northward_wind_at_ten_meters"].values)),
             ("u10", lambda d: d["eastward_wind_at_ten_meters"].values),
             ("v10", lambda d: d["northward_wind_at_ten_meters"].values),
-            ("precip_mmday", lambda d: d["PRATEsfc"].values * 86400.0),
+            # The models' own space: in mm/day a few unphysical point spikes from inverting it dominate MSE.
+            ("precip_log1p", lambda d: np.log1p(np.maximum(d["PRATEsfc"].values * 86400.0, 0.0))),
             ("T2m", lambda d: d["air_temperature_at_two_meters"].values),
         ):
             ens = np.stack([get(box(p.isel(ensemble=e), la, lo, HALF_BOX)) for e in range(p.sizes["ensemble"])])
@@ -76,7 +77,7 @@ for t_str, la, lo in track:
 df = pd.DataFrame(rows)
 pd.set_option("display.width", 200)
 cols = ["minSLP_MSE_ensmean", "minSLP_MSE_member", "minSLP_CRPS", "PRMSL_MSE", "PRMSL_CRPS", "wind10m_MSE", "wind10m_CRPS",
-        "u10_MSE", "u10_CRPS", "v10_MSE", "v10_CRPS", "precip_mmday_MSE", "precip_mmday_CRPS", "T2m_MSE", "T2m_CRPS"]
+        "u10_MSE", "u10_CRPS", "v10_MSE", "v10_CRPS", "precip_log1p_MSE", "precip_log1p_CRPS", "T2m_MSE", "T2m_CRPS"]
 for label, sub in (("INTENSE (truth min SLP < 990 hPa)", df[df.truth_slp < 990]), ("ALL FRAMES", df)):
     tab = sub.groupby("model")[cols].mean().loc[models]
     tab["n_frames"] = sub.groupby("model").size()

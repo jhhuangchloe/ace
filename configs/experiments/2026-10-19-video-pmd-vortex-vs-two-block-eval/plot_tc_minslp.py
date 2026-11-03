@@ -22,7 +22,7 @@ from v3_curve import V3Curves
 
 root, storm, tracks_json, truth_path, out_png, *models = sys.argv[1:]
 HALF = 2.5
-COLORS = {"two-block": "#2ca02c", "vortex": "#d62728"}
+COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e"}
 BASE_COLORS = {"nearest": "#9ecae1", "bicubic": "#1f77b4"}
 track = json.load(open(tracks_json))[storm]
 truth = xr.open_zarr(truth_path)["PRMSL"]
@@ -37,6 +37,8 @@ v3 = V3Curves(
     region["lat_extent"], region["lon_extent"],
 )
 V3_SERIES = {"baseline": ("#9467bd", "-"), "raw": ("#8c564b", ":")}
+# V3_SERIES env: which V3 curves to show, any of "baseline raw" (default both)
+V3_SERIES = {k: V3_SERIES[k] for k in os.environ.get("V3_SERIES", "baseline raw").split()}
 V3_LABELS = {
     "baseline": "V3 baseline (coarse, as used in the diffusion model)",
     "raw": "V3 raw 25 km output",
@@ -66,8 +68,8 @@ for t_str, la, lo in track:
     tr.append(float(win_min(truth.sel(time=t), la, lo)))
     for u, b in bases.items():
         bl[u].append(float(win_min(b.field("PRMSL", t), la, lo)))
-    v3s["baseline"].append(float(win_min(v3.baseline("PRMSL", t), la, lo)))
-    v3s["raw"].append(float(win_min(v3.raw("PRMSL", t), la, lo)))
+    for k in V3_SERIES:
+        v3s[k].append(float(win_min(getattr(v3, k)("PRMSL", t), la, lo)))
     for m in models:
         mem[m].append(per_model[m])
 

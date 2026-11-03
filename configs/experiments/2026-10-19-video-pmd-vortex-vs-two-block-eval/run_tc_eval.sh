@@ -11,7 +11,8 @@
 # S2022 (default) uses only the 2022 data already local; the 2023 storms T789/T795/T829 need
 # prepare_data.py --val-stop 2024-01-04 to have finished.
 # Knobs: GPU (4), N_ENS (4), STORMS (default S2022; also T789 T795 T829), CKPT_NAME (latest.ckpt),
-# BATCH (clips per batch, 2), MIN_FREE_GB (25), OUT, ENV_NAME. Inference is resumable.
+# BATCH (clips per batch, 2), MIN_FREE_GB (25), OUT, ENV_NAME, MODELS ("vortex two-block"; also v3-ou).
+# Inference is resumable.
 set -euo pipefail
 
 GPU="${GPU:-4}"
@@ -40,12 +41,15 @@ REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 declare -A TRAIN_CFG=(
     [vortex]="$REPO_ROOT/configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/video_train.yaml"
     [two-block]="$REPO_ROOT/configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/video_train_control.yaml"
+    # v3-detail + OU two-block: the run's own saved config (no single repo yaml matches its run dir).
+    [v3-ou]="$RUNS/video-pmd-two-block-v3-baseline-ou-detail/config.yaml"
 )
 declare -A RUN_DIR=(
     [vortex]="$RUNS/video-pmd-two-block-vortex-shift"
     [two-block]="/data/pmd/checkpoints/two-block-flat"
+    [v3-ou]="$RUNS/video-pmd-two-block-v3-baseline-ou-detail"
 )
-MODELS=(vortex two-block)  # first = model under test
+read -r -a MODELS <<<"${MODELS:-vortex two-block}"  # first = model under test
 
 # Host kernel module is older than the installed userspace NVIDIA libs; use the matching on-disk ones.
 KMOD_VER=$(awk '/NVRM version/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {print $i; exit}}' /proc/driver/nvidia/version)
