@@ -1,0 +1,85 @@
+# Full test-set inference (2023-01-01 .. 2024-01-04, global) for the two-block v3-detail + OU
+# model (run dir /data/pmd/runs/video-pmd-two-block-v3-baseline-ou-detail, 60/60 epochs), on the same
+# split, domain, tiling and ensemble size as
+# ../2026-09-15-video-pmd-spatiotemporal-25km-100km-two-block-hiro-patch-test-inference-global/ and
+# ../2026-10-30-stvsr-rstt-baseline/test_inference.yaml. best.ckpt is epoch 55 (lowest
+# validation/interior_mae). model: is copied from the run's saved config.yaml.
+#
+#   CUDA_VISIBLE_DEVICES=4,5 NCCL_SHM_DISABLE=1 conda run --no-capture-output -n fme \
+#       torchrun --standalone --nproc_per_node 2 -m fme.downscaling.video_inference \
+#       configs/experiments/2026-10-15-video-pmd-two-block-v3-baseline/test_inference_ou_detail.yaml
+#
+# batch_size is global (split across ranks) and the loader drops a partial last batch, so it must
+# divide the 368 test clips per rank: 16 on 2 GPUs = 8 clips/GPU (~65-70 GB est.; 4/GPU used 35 GB).
+#
+# Resumable: rerun after an interruption and finished batches are skipped.
+checkpoint_path: /data/pmd/runs/video-pmd-two-block-v3-baseline-ou-detail/checkpoints/best.ckpt
+experiment_dir: /data/pmd/runs/eval-v3-ou-detail/test-logs
+output_path: /data/pmd/runs/eval-v3-ou-detail/test-2023-2024-global-ens4.zarr
+n_ensemble: 4
+ensemble_chunk_size: 1
+use_ema: true
+resume: true
+divide_generation: true
+coarse_patch_extent: [44, 72]
+coarse_horizontal_overlap: 1
+logging: {log_to_screen: true, log_to_wandb: false, log_to_file: true, project: ace-temporal-interp,
+  name: local-25km-100km-two-block-v3-baseline-ou-detail-test-inference, entity: ai2cm}
+data:
+  n_timesteps: 9
+  fine:
+  - data_path: /data/pmd/local_data
+    file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-25km.zarr
+    engine: zarr
+    subset: {start_time: '2023-01-01', stop_time: '2024-01-04'}
+  coarse:
+  - data_path: /data/pmd/local_data
+    file_pattern: 2026-07-14-X-SHiELD-AMIP-FME-3h-100km.zarr
+    engine: zarr
+    subset: {start_time: '2023-01-01', stop_time: '2024-01-04'}
+  batch_size: 16
+  num_data_workers: 1
+  strict_ensemble: false
+  lat_extent: {start: -88, stop: 88}
+  lon_extent: {start: 0, stop: 360}
+model:
+  n_timesteps: 9
+  model_channels: 128
+  n_heads: 8
+  num_freqs: 4
+  backbone: simple
+  noise_embedding_type: positional
+  channel_mult: [1, 2, 2, 2, 2]
+  num_blocks: 2
+  attention_levels: [3, 4]
+  sigma_min: 0.002
+  sigma_max: 150.0
+  churn: 0.0
+  num_diffusion_generation_steps: 50
+  endpoints_observed: false
+  coarse_endpoints_only: true
+  two_block: true
+  r_kernel: ou
+  r_kernel_length_scale_by_channel: {eastward_wind_at_ten_meters: 0.225, northward_wind_at_ten_meters: 0.225,
+    PRMSL: 0.375, PRATEsfc: 0.2, air_temperature_at_two_meters: 0.275}
+  d_kernel: independent
+  v3_baseline_checkpoint: /data/pmd/v3_baseline/v3_baseline_9yr.pt
+  v3_detail_baseline: true
+  r_sigma_data_by_channel: {eastward_wind_at_ten_meters: 0.1521, northward_wind_at_ten_meters: 0.1843,
+    PRMSL: 0.0716, PRATEsfc: 0.4566, air_temperature_at_two_meters: 0.0568}
+  d_sigma_data_by_channel: {eastward_wind_at_ten_meters: 0.1317, northward_wind_at_ten_meters: 0.1581,
+    PRMSL: 0.0266, PRATEsfc: 0.3965, air_temperature_at_two_meters: 0.0431}
+  log_transform_channels: {PRATEsfc: 86400.0}
+  out_names: [eastward_wind_at_ten_meters, northward_wind_at_ten_meters, PRMSL, PRATEsfc,
+    air_temperature_at_two_meters]
+  normalization:
+    means: {eastward_wind_at_ten_meters: -0.0362, northward_wind_at_ten_meters: 0.17047,
+      PRMSL: 1008.160699, PRATEsfc: 0.484074, air_temperature_at_two_meters: 279.675977}
+    stds: {eastward_wind_at_ten_meters: 5.627319, northward_wind_at_ten_meters: 4.692752,
+      PRMSL: 15.043594, PRATEsfc: 0.850964, air_temperature_at_two_meters: 20.455977}
+  coarse_normalization:
+    means: {eastward_wind_at_ten_meters: -0.036135, northward_wind_at_ten_meters: 0.186555,
+      PRMSL: 1008.281106, PRATEsfc: 0.557112, air_temperature_at_two_meters: 279.3386}
+    stds: {eastward_wind_at_ten_meters: 5.548626, northward_wind_at_ten_meters: 4.603089,
+      PRMSL: 14.908773, PRATEsfc: 0.871331, air_temperature_at_two_meters: 20.2363}
+
