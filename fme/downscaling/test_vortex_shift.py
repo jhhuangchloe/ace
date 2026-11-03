@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from fme.downscaling.twoblock import coarse_temporal_interp
-from fme.downscaling.vortex_shift import vortex_shift_interp
+from fme.downscaling.vortex_shift import vortex_shift_blend, vortex_shift_interp
 
 N_TIMES = 9
 SHAPE = (40, 60)
@@ -88,3 +88,71 @@ def test_preserves_shape_and_dtype(dtype):
     clip = _vortex_clip((20.0, 15.0), (22.0, 30.0)).to(dtype)
     out = _shift(clip)
     assert out.shape == clip.shape and out.dtype == dtype
+
+
+def _blend(clip, base, **kwargs):
+    return vortex_shift_blend(
+        clip, base, slp_index=0, min_depth=2.0, search_cells=25.0, **kwargs
+    )
+
+
+def _shallow_base(truth, depth_fraction=0.6):
+    """A baseline that tracks the storm but smooths its core (like V3): the true
+    trajectory with the storm scaled to ``depth_fraction`` of its depth."""
+    base = truth.clone()
+    base[:, :, 1:-1] = depth_fraction * truth[:, :, 1:-1]
+    return base
+
+
+def test_blend_pins_endpoints_and_keeps_the_base_far_from_the_storm():
+    truth = _vortex_clip((20.0, 15.0), (20.0, 35.0))
+    base = _shallow_base(truth)
+    out = _blend(truth, base)
+    assert torch.equal(out[:, :, 0], truth[:, :, 0])
+    assert torch.equal(out[:, :, -1], truth[:, :, -1])
+    # rows 0-4 are >= 15 cells from the storm track, beyond the 9-cell blend disc
+    assert torch.equal(out[:, :, 1:-1, :5], base[:, :, 1:-1, :5])
+    assert not torch.allclose(out[:, :, 1:-1], base[:, :, 1:-1])
+
+
+def test_blend_restores_the_core_depth_of_a_smoothed_baseline():
+    truth = _vortex_clip((20.0, 15.0), (20.0, 35.0))
+    base = _shallow_base(truth)
+    out = _blend(truth, base)
+    mid = N_TIMES // 2
+    true_min = float(truth[0, 0, mid].min())
+    assert abs(float(out[0, 0, mid].min()) - true_min) < 0.5 * abs(
+        float(base[0, 0, mid].min()) - true_min
+    )
+    assert out[0, 0, mid].argmin() == truth[0, 0, mid].argmin()
+    # the passive channel is blended consistently with the storm
+    assert torch.allclose(out[:, 1], 0.5 * out[:, 0], atol=1e-4)
+
+
+def test_blend_without_a_detected_storm_returns_the_base():
+    flat = 0.01 * torch.randn(2, 2, N_TIMES, *SHAPE, generator=torch.manual_seed(0))
+    base = coarse_temporal_interp(flat)
+    base[:, :, 1:-1] += 0.3  # any baseline that keeps the endpoints
+    assert torch.equal(_blend(flat, base), base)
+
+
+def test_blend_only_changes_samples_with_a_storm():
+    storm = _vortex_clip((20.0, 15.0), (20.0, 35.0))
+    batch = torch.cat([storm, torch.zeros_like(storm)])
+    base = _shallow_base(batch)
+    out = _blend(batch, base)
+    assert torch.equal(out[1], base[1])
+    assert not torch.allclose(out[0], base[0])
+
+
+def test_blend_rejects_a_base_with_the_wrong_shape():
+    truth = _vortex_clip((20.0, 15.0), (20.0, 35.0))
+    with pytest.raises(ValueError, match="must match"):
+        _blend(truth, truth[:, :, :-1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_blend_preserves_shape_and_dtype(dtype):
+    truth = _vortex_clip((20.0, 15.0), (22.0, 30.0)).to(dtype)
+    out = _blend(truth, _shallow_base(truth))
+    assert out.shape == truth.shape and out.dtype == dtype

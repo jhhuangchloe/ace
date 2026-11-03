@@ -177,3 +177,95 @@ def vortex_shift_interp(
     out[:, :, 0] = coarse_clip[:, :, 0]
     out[:, :, -1] = coarse_clip[:, :, -1]
     return out
+
+
+@torch.no_grad()
+def vortex_shift_blend(
+    coarse_clip: torch.Tensor,
+    base: torch.Tensor,
+    slp_index: int,
+    min_depth: float,
+    taper_cells: float = 6.0,
+    search_cells: float = 10.0,
+    ring: tuple[float, float] = (3.0, 6.0),
+    blend_radius_factor: float = 1.5,
+) -> torch.Tensor:
+    """Blend the translated-vortex field of ``vortex_shift_interp`` into a better
+    baseline ``base`` (e.g. a learned one) in a disc around each detected storm.
+
+    ``base`` already follows a moving storm well but can smooth its core (V3 loses
+    5-7 hPa of depth in the strongest storms). Near a storm detected in both
+    endpoint frames (same detection as ``vortex_shift_interp``), each interior frame
+    becomes ``base + w * (shifted - base)``, with ``shifted`` the frame
+    ``vortex_shift_interp`` would give and ``w`` a cosine disc of radius
+    ``blend_radius_factor * taper_cells`` around the linearly interpolated centre
+    (``w = 1`` at the centre, 0 outside). Everything outside the discs, samples
+    without a detected storm, and both endpoint frames are returned unchanged
+    (the endpoints are set to ``coarse_clip``'s, so ``r`` stays pinned to zero there).
+
+    Adding the translation correction ``shifted - linear`` on top of ``base`` instead
+    double-counts the translation ``base`` already does, so the blend replaces
+    ``base`` by the shifted field rather than adding to it.
+
+    Args:
+        coarse_clip: ``(B, C, T, h, w)`` coarse clip; only frames 0 and -1 are used.
+        base: ``(B, C, T, h, w)`` baseline to improve, equal to ``coarse_clip`` at
+            frames 0 and -1.
+        slp_index, min_depth, taper_cells, search_cells, ring: as in
+            ``vortex_shift_interp``.
+        blend_radius_factor: Disc radius in units of ``taper_cells`` (>= 1, so the
+            whole shifted anomaly lies inside the disc).
+
+    Returns:
+        ``(B, C, T, h, w)`` blended baseline.
+    """
+    if base.shape != coarse_clip.shape:
+        raise ValueError(
+            f"base {tuple(base.shape)} must match coarse_clip {tuple(coarse_clip.shape)}."
+        )
+    batch, _, n_times, height, width = coarse_clip.shape
+    out = base.clone()
+    margin = max(int(math.ceil(ring[1] / 2)), 2)
+    blend_cells = blend_radius_factor * taper_cells
+    for b in range(batch):
+        c0 = _find_center(
+            coarse_clip[b, slp_index, 0], min_depth, None, search_cells, margin, ring
+        )
+        if c0 is None:
+            continue
+        c1 = _find_center(
+            coarse_clip[b, slp_index, -1], min_depth, c0, search_cells, margin, ring
+        )
+        if c1 is None:
+            continue
+        first, last = coarse_clip[b, :, 0], coarse_clip[b, :, -1]
+        anomaly_first = _anomaly(first, c0, taper_cells)
+        anomaly_last = _anomaly(last, c1, taper_cells)
+        for k in range(1, n_times - 1):
+            tau = k / (n_times - 1)
+            c_row = (1 - tau) * c0[0] + tau * c1[0]
+            c_col = (1 - tau) * c0[1] + tau * c1[1]
+            shifted = (
+                (1 - tau) * first
+                + tau * last
+                + (1 - tau)
+                * (
+                    _translate(anomaly_first, c_row - c0[0], c_col - c0[1])
+                    - anomaly_first
+                )
+                + tau
+                * (
+                    _translate(anomaly_last, c_row - c1[0], c_col - c1[1])
+                    - anomaly_last
+                )
+            )
+            dist = (
+                _radius_grid((height, width), (c_row, c_col), out.device) / blend_cells
+            )
+            weight = torch.where(
+                dist < 1, 0.5 * (1 + torch.cos(math.pi * dist)), torch.zeros_like(dist)
+            ).to(out.dtype)
+            out[b, :, k] = base[b, :, k] + weight * (shifted - base[b, :, k])
+    out[:, :, 0] = coarse_clip[:, :, 0]
+    out[:, :, -1] = coarse_clip[:, :, -1]
+    return out

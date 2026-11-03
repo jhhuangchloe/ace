@@ -99,7 +99,7 @@ from fme.downscaling.v3_baseline import (
     load_v3_baseline,
     v3_coarse_interior,
 )
-from fme.downscaling.vortex_shift import vortex_shift_interp
+from fme.downscaling.vortex_shift import vortex_shift_blend, vortex_shift_interp
 
 CHANNEL_AXIS = 1
 
@@ -537,6 +537,13 @@ class VideoDiffusionModelConfig:
     vortex_min_depth: float = 5.0
     vortex_taper_cells: float = 6.0  # coarse cells
     vortex_search_cells: float = 10.0  # max endpoint-to-endpoint centre distance
+    # Combined with v3_baseline_checkpoint the vortex shift does not replace V3's
+    # baseline: V3's I(tau) is kept everywhere except in a cosine disc of radius
+    # vortex_blend_radius_factor * vortex_taper_cells around each detected storm, where
+    # it is blended into the translated-vortex field (vortex_shift.vortex_shift_blend).
+    # V3 already tracks the storm centre as well as the shift does but smooths the
+    # core depth, which the shifted anomaly preserves. Unused without V3.
+    vortex_blend_radius_factor: float = 1.5
     # Learned two-block baseline (fme/downscaling/v3_baseline.py): I(tau) is the
     # coarse (4x4 physical mean) version of a V3 model's 25 km output for the
     # two coarse endpoint frames (V3: Becker et al., ICLR 2026), pinned to the
@@ -918,11 +925,6 @@ class VideoDiffusionModelConfig:
         if self.v3_baseline_checkpoint is not None:
             if not self.two_block:
                 raise ValueError("v3_baseline_checkpoint requires two_block=True.")
-            if self.vortex_shift_baseline:
-                raise ValueError(
-                    "v3_baseline_checkpoint and vortex_shift_baseline are mutually "
-                    "exclusive: both replace the linear baseline I(tau)."
-                )
             if self.n_timesteps != 9:
                 raise ValueError(
                     "v3_baseline_checkpoint requires n_timesteps=9 (the V3 model "
@@ -952,6 +954,11 @@ class VideoDiffusionModelConfig:
                 raise ValueError(
                     "vortex_min_depth, vortex_taper_cells and vortex_search_cells "
                     "must be > 0."
+                )
+            if self.vortex_blend_radius_factor < 1.0:
+                raise ValueError(
+                    "vortex_blend_radius_factor must be >= 1 (the blend disc has to "
+                    f"contain the shifted anomaly), got {self.vortex_blend_radius_factor}."
                 )
         if self.backbone not in ("simple", "songunet"):
             raise ValueError(
@@ -1963,7 +1970,9 @@ class VideoDiffusionModel:
         near a detected vortex when ``vortex_shift_baseline`` is set.
         """
         if self._v3 is not None:
-            return self._v3_baseline_interp(coarse_clip)
+            return self._with_vortex_blend(
+                self._v3_baseline_interp(coarse_clip), coarse_clip
+            )
         if not self.config.vortex_shift_baseline:
             return coarse_temporal_interp(coarse_clip)
         assert self.coarse_normalizer is not None
@@ -2001,8 +2010,33 @@ class VideoDiffusionModel:
         fine-scale part of V3's own 25 km trajectory (``None`` otherwise).
         """
         if self._v3 is not None and self.config.v3_detail_baseline:
-            return self._v3_baseline_pair(coarse_clip, factor)
+            interp, detail = self._v3_baseline_pair(coarse_clip, factor)
+            return self._with_vortex_blend(interp, coarse_clip), detail
         return self._two_block_interp(coarse_clip), None
+
+    @torch.no_grad()
+    def _with_vortex_blend(
+        self, interp: torch.Tensor, coarse_clip: torch.Tensor
+    ) -> torch.Tensor:
+        """With ``vortex_shift_baseline`` and a V3 baseline, blend the translated
+        vortex into V3's ``I(tau)`` around detected storms; otherwise ``interp``.
+        """
+        if not self.config.vortex_shift_baseline:
+            return interp
+        assert self.coarse_normalizer is not None
+        channel = self.config.vortex_slp_channel
+        min_depth = self.config.vortex_min_depth / float(
+            self.coarse_normalizer.stds[channel]
+        )
+        return vortex_shift_blend(
+            coarse_clip,
+            interp,
+            slp_index=self.out_names.index(channel),
+            min_depth=min_depth,
+            taper_cells=self.config.vortex_taper_cells,
+            search_cells=self.config.vortex_search_cells,
+            blend_radius_factor=self.config.vortex_blend_radius_factor,
+        )
 
     @torch.no_grad()
     def _v3_baseline_interp(self, coarse_clip: torch.Tensor) -> torch.Tensor:

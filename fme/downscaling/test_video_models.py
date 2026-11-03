@@ -1725,12 +1725,20 @@ def test_v3_baseline_config_validation(tmp_path):
     checkpoint = _write_tiny_v3(tmp_path / "v3.pt")
     with pytest.raises(ValueError, match="requires two_block"):
         _coarse_endpoints_only_model(9, v3_baseline_checkpoint=checkpoint)
-    with pytest.raises(ValueError, match="mutually exclusive"):
+    # V3 and the vortex shift can be combined (blend of the shifted vortex into V3)
+    _two_block_model(
+        9,
+        v3_baseline_checkpoint=checkpoint,
+        vortex_shift_baseline=True,
+        vortex_slp_channel="var0",
+    )
+    with pytest.raises(ValueError, match="vortex_blend_radius_factor"):
         _two_block_model(
             9,
             v3_baseline_checkpoint=checkpoint,
             vortex_shift_baseline=True,
             vortex_slp_channel="var0",
+            vortex_blend_radius_factor=0.5,
         )
     with pytest.raises(ValueError, match="n_timesteps=9"):
         _two_block_model(5, v3_baseline_checkpoint=checkpoint)
@@ -2037,6 +2045,75 @@ def test_bicubic_spatial_upsample_train_and_exact_coarse_recovery():
         assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
 
 
+def _v3_vortex_model(tmp_path, n_times=9, detail=False, **config_kwargs):
+    kwargs = dict(
+        vortex_shift_baseline=True,
+        vortex_slp_channel="var0",
+        vortex_min_depth=2.0,
+        vortex_search_cells=12.0,
+        **config_kwargs,
+    )
+    if detail:
+        return _v3_detail_model(tmp_path, **kwargs)
+    return _v3_two_block_model(tmp_path, n_times, **kwargs)
+
+
+def test_v3_vortex_blend_adds_a_single_baseline_block(tmp_path):
+    v3 = _v3_two_block_model(tmp_path).module.module.model
+    both = _v3_vortex_model(tmp_path).module.module.model
+    assert both.in_conv.conv.in_channels == v3.in_conv.conv.in_channels
+
+
+def test_v3_vortex_blend_pins_endpoints_and_changes_the_baseline_only_near_the_storm(
+    tmp_path,
+):
+    v3_only = _v3_two_block_model(tmp_path)
+    both = _v3_vortex_model(tmp_path)
+    batch = _batch_with_travelling_low(9)  # low on row 12, cols 7 -> 17 of a 24x24 grid
+    coarse = both._pack_normalized(batch.coarse.data, both.coarse_normalizer)
+    base = v3_only._two_block_interp(coarse)
+    blended = both._two_block_interp(coarse)
+    assert torch.equal(blended[:, :, 0], coarse[:, :, 0])
+    assert torch.equal(blended[:, :, -1], coarse[:, :, -1])
+    # beyond the 9-cell blend disc (rows >= 22) V3's baseline is untouched ...
+    assert torch.equal(blended[..., 22:, :], base[..., 22:, :])
+    # ... and near the storm it is replaced by the shifted vortex
+    assert (blended - base)[:, :, 1:-1, 6:19, 3:22].abs().max() > 1e-3
+
+
+def test_v3_vortex_blend_deepens_the_core_of_a_smoothed_v3_baseline(tmp_path):
+    """V3 with its field switched off just holds the nearest endpoint: a storm that
+    travels is badly represented. The blend must bring the baseline closer to the
+    true clip near the storm and not make the far field any worse."""
+    v3_only = _v3_two_block_model(tmp_path, zero_field=True)
+    both = _v3_vortex_model(tmp_path, zero_field=True)
+    batch = _batch_with_travelling_low(9)
+    coarse = both._pack_normalized(batch.coarse.data, both.coarse_normalizer)
+    err_v3 = (v3_only._two_block_interp(coarse) - coarse)[..., 3:22, 0:24] ** 2
+    err_both = (both._two_block_interp(coarse) - coarse)[..., 3:22, 0:24] ** 2
+    assert err_both.mean() < 0.5 * err_v3.mean()
+
+
+def test_v3_vortex_blend_train_and_exact_coarse_recovery(tmp_path):
+    factor = 2
+    model = _v3_vortex_model(tmp_path)
+    batch = _batch_with_travelling_low(9, factor=factor)
+
+    outputs = model.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
+    outputs.loss.backward()
+    assert all(p.grad is None for p in model._v3.parameters())  # frozen
+
+    generated = model.generate(batch, n_samples=2)
+    coarse_norm = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
+    interp_phys = model._denormalize_invert(model._two_block_interp(coarse_norm))
+    for name in [n for n in OUT_NAMES if n != "var1"]:  # exact in model space
+        down = conservative_downsample(generated[name], factor)
+        ref = interp_phys[name].unsqueeze(1).expand_as(down)
+        assert torch.allclose(down[:, :, 0], ref[:, :, 0], atol=1e-4)
+        assert torch.allclose(down[:, :, -1], ref[:, :, -1], atol=1e-4)
+
+
 def test_bicubic_spatial_upsample_changes_the_coarse_conditioning():
     block = _two_block_model(5)
     bicubic = _two_block_model(5, two_block_spatial_upsample="bicubic")
@@ -2055,3 +2132,21 @@ def test_v3_detail_baseline_with_bicubic_upsampling_has_no_coarse_average(tmp_pa
     coarse = model._pack_normalized(batch.coarse.data, model.coarse_normalizer)
     _, detail = model._two_block_baselines(coarse, 4)
     assert conservative_downsample(detail, 4).abs().max() < 1e-5
+
+
+def test_v3_vortex_blend_with_the_detail_baseline(tmp_path):
+    """The detail baseline Pi(B) stays V3's own; only the coarse I is blended."""
+    both = _v3_vortex_model(tmp_path, detail=True)
+    detail_only = _v3_detail_model(tmp_path)
+    batch = _batch_with_travelling_low(9, factor=4, batch_size=1)
+    coarse = both._pack_normalized(batch.coarse.data, both.coarse_normalizer)
+    interp, detail = both._two_block_baselines(coarse, 4)
+    base_interp, base_detail = detail_only._two_block_baselines(coarse, 4)
+    assert torch.equal(detail, base_detail)
+    assert torch.equal(interp[:, :, 0], coarse[:, :, 0])
+    assert torch.equal(interp[:, :, -1], coarse[:, :, -1])
+    assert (interp - base_interp)[:, :, 1:-1].abs().max() > 1e-3
+    assert torch.allclose(interp, both._two_block_interp(coarse), atol=1e-6)
+
+    outputs = both.train_on_batch(batch, NullOptimization())
+    assert torch.isfinite(outputs.loss)
