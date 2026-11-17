@@ -22,7 +22,8 @@ from v3_curve import V3Curves
 
 root, storm, tracks_json, truth_path, out_png, *models = sys.argv[1:]
 HALF = 2.5
-COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e", "v3-residual": "#ff7f0e"}
+COLORS = {"two-block": "#2ca02c", "vortex": "#d62728", "v3-ou": "#ff7f0e", "v3-residual": "#ff7f0e",
+          "v3-flat": "#e377c2", "v3-vortex": "#17becf", "rstt": "#bcbd22", "cascade": "#7f7f7f"}
 BASE_COLORS = {"nearest": "#9ecae1", "bicubic": "#1f77b4"}
 track = json.load(open(tracks_json))[storm]
 truth = xr.open_zarr(truth_path)["PRMSL"]
