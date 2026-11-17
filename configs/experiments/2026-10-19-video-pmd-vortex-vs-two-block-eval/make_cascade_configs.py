@@ -43,7 +43,8 @@ casc = yaml.safe_load(open(REPO / "configs/experiments/2026-08-24-hiro-downscali
 # The HiRO checkpoint was trained with apex GroupNorm (use_apex_gn: true), which is not installed here. The weights
 # are the same either way, so write a copy of the checkpoint with use_apex_gn switched off.
 hiro_src = "/data/pmd/checkpoints/hiro-v6/checkpoints/ema_ckpt.tar"
-hiro = out / "hiro-v6-noapex.ckpt"
+import os
+hiro = Path(os.environ.get("HIRO_NOAPEX_CKPT", out / "hiro-v6-noapex.ckpt"))
 if not hiro.exists():
     ck = torch.load(hiro_src, map_location="cpu", weights_only=False)
     ck["model"]["config"]["module"]["config"]["use_apex_gn"] = False
