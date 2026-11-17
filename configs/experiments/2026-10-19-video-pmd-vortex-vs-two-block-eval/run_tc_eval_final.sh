@@ -98,13 +98,12 @@ link v3-ou "$RUNS/eval-tc-vortex-vs-two-block/v3-ou-fineunits"
 link two-block "$RUNS/eval-tc-vortex-vs-two-block/corrected/two-block"
 link rstt "$RUNS/eval-tc-vortex-vs-two-block/rstt"
 MODELS=(v3-vortex v3-flat v3-ou two-block rstt)
-if [ -n "${CASCADE_ZARR:-}" ]; then
+if [ -n "${CASCADE_ZARR:-}" ] && [ "$(readlink -f "$CASCADE_ZARR")" != "$(readlink -f "$OUT/cascade/$STORM_NAME.zarr" 2>/dev/null || true)" ]; then
     mkdir -p "$OUT/cascade"; ln -sfn "$CASCADE_ZARR" "$OUT/cascade/$STORM_NAME.zarr"
     [ -f "${CASCADE_ZARR%.zarr}.yaml" ] && ln -sfn "${CASCADE_ZARR%.zarr}.yaml" "$OUT/cascade/$STORM_NAME.yaml"
-    MODELS+=(cascade)
-else
-    echo "NOTE: no CASCADE_ZARR given; the cascade is not in this comparison."
 fi
+if [ -d "$OUT/cascade/$STORM_NAME.zarr" ]; then MODELS+=(cascade)  # also picks up run_cascade_s2022.sh's output
+else echo "NOTE: no cascade output ($OUT/cascade/$STORM_NAME.zarr; run_cascade_s2022.sh or CASCADE_ZARR=); not in this comparison."; fi
 MODELS=($(for m in "${MODELS[@]}"; do [ -d "$OUT/$m/$STORM_NAME.zarr" ] && echo "$m"; done))
 echo "models: ${MODELS[*]}"
 
