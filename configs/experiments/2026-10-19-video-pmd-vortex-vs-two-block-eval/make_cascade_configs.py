@@ -14,6 +14,7 @@ import copy
 import sys
 from pathlib import Path
 
+import torch
 import yaml
 
 out_dir, start, stop, n_ens, lat0, lat1, lon0, lon1 = sys.argv[1:]
@@ -39,8 +40,17 @@ s1["data"]["num_data_workers"] = 1
 yaml.safe_dump(s1, open(out / "stage1.yaml", "w"), sort_keys=False)
 
 casc = yaml.safe_load(open(REPO / "configs/experiments/2026-08-24-hiro-downscaling-cascade-infill-then-sr/inference.yaml"))
+# The HiRO checkpoint was trained with apex GroupNorm (use_apex_gn: true), which is not installed here. The weights
+# are the same either way, so write a copy of the checkpoint with use_apex_gn switched off.
+hiro_src = "/data/pmd/checkpoints/hiro-v6/checkpoints/ema_ckpt.tar"
+hiro = out / "hiro-v6-noapex.ckpt"
+if not hiro.exists():
+    ck = torch.load(hiro_src, map_location="cpu", weights_only=False)
+    ck["model"]["config"]["module"]["config"]["use_apex_gn"] = False
+    torch.save(ck, hiro)
+    print(f"wrote {hiro} (use_apex_gn=False)")
 s2 = {
-    "model": {"checkpoint_path": "/data/pmd/checkpoints/hiro-v6/checkpoints/ema_ckpt.tar"},
+    "model": {"checkpoint_path": str(hiro)},
     "experiment_dir": f"{out}/stage2",
     "logging": {**casc["logging"], "log_to_wandb": False, "name": "cascade-stage2-sr-local"},
     "data": {
