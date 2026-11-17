@@ -5,7 +5,8 @@
 # free-memory check uses torch.cuda.mem_get_info instead.
 #
 #   bash configs/experiments/2026-10-10-video-pmd-two-block-vortex-shift/run_tmp_gpus2-5.sh
-# Knobs: MIN_FREE_GB (default 45; ~38 GB peak per GPU at 1 sample/GPU), ENV_NAME, GPUS, CONFIG.
+# Knobs: RESERVE_GB_PER_SAMPLE (default 40: reserve 40 GB x samples-per-GPU on each GPU at start, 0 = off),
+# MIN_FREE_GB (default = the reservation, at least 45), ENV_NAME, GPUS, CONFIG.
 set -euo pipefail
 
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
@@ -25,7 +26,10 @@ fi
 
 GPUS="${GPUS:-2,3,4,5}"
 ENV_NAME="${ENV_NAME:-fme}"
-MIN_FREE_GB="${MIN_FREE_GB:-45}"
+# GB of GPU memory to RESERVE up front per sample per GPU (the model's real use ramps up slowly and other
+# jobs on this host grab free memory in the meantime). 0 disables. Reserved total per GPU =
+# RESERVE_GB_PER_SAMPLE x (batch_size / n_gpus), e.g. 40 x 2 = 80 GB.
+RESERVE_GB_PER_SAMPLE="${RESERVE_GB_PER_SAMPLE:-40}"
 DATA_DIR="/data/pmd/local_data"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +42,10 @@ if [ $((BATCH % N_GPUS)) -ne 0 ]; then
     echo "batch_size $BATCH in $CONFIG is not divisible by $N_GPUS GPUs (GPUS=$GPUS)." >&2
     exit 1
 fi
+
+RESERVE_GB=$(( RESERVE_GB_PER_SAMPLE * BATCH / N_GPUS ))
+MIN_FREE_GB="${MIN_FREE_GB:-$(( RESERVE_GB > 45 ? RESERVE_GB : 45 ))}"  # must have at least what we reserve
+echo "reserving ${RESERVE_GB} GB per GPU (${RESERVE_GB_PER_SAMPLE} GB x $((BATCH / N_GPUS)) samples/GPU); free-memory guard ${MIN_FREE_GB} GB"
 
 for store in 25km 100km; do
     if [ ! -d "$DATA_DIR/2026-07-14-X-SHiELD-AMIP-FME-3h-$store.zarr" ]; then
@@ -70,7 +78,8 @@ echo "gpus=$GPUS config=$CONFIG experiment_dir=$EXPERIMENT_DIR"
 ls -l "$EXPERIMENT_DIR/checkpoints/latest.ckpt" 2>/dev/null || echo "no latest.ckpt in $EXPERIMENT_DIR: starting from scratch"
 
 cd "$REPO_ROOT"
-CUDA_VISIBLE_DEVICES="$GPUS" PYTHONUNBUFFERED=1 \
+CUDA_VISIBLE_DEVICES="$GPUS" PYTHONUNBUFFERED=1 RESERVE_GPU_GB="$RESERVE_GB" \
+    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     conda run --no-capture-output -n "$ENV_NAME" \
     torchrun --standalone --nproc_per_node "$N_GPUS" \
-    -m fme.downscaling.video_train "$CONFIG" 2>&1 | tee -a "$EXPERIMENT_DIR/train_stdout.log"
+    "$SCRIPT_DIR/reserve_gpu_run.py" fme.downscaling.video_train "$CONFIG" 2>&1 | tee -a "$EXPERIMENT_DIR/train_stdout.log"
